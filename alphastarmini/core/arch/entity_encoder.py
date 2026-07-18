@@ -93,7 +93,7 @@ class EntityEncoder(nn.Module):
         super().__init__()
 
         self.dropout = nn.Dropout(dropout)
-        self.embedd = nn.Linear(AHP.embedding_size, original_256)
+        self.embedd = nn.Linear(AHP.embedding_size, original_256) # 对输入的实体进行编码，特征提取，把原始实体特征从"手工编码的稀疏高维空间"映射到 Transformer 所需的"固定维度稠密空间"。
         self.transformer = Transformer(d_model=original_256, d_inner=original_1024,
                                        n_layers=3, n_head=2, d_k=original_128, 
                                        d_v=original_128, 
@@ -441,26 +441,31 @@ class EntityEncoder(nn.Module):
         return all_entities_array
 
     def forward(self, x, debug=False, return_unit_types=False):
+        '''
+        x: 输入游戏的实体信息（实体（单位、建筑等）），shape (batch, 实体数量，embedding_size)
+        '''
         # refactor by reference mostly to https://github.com/opendilab/DI-star
         # some mistakes for transformer are fixed
-        batch_size = x.shape[0]
-        entities_size = x.shape[1]
+        batch_size = x.shape[0] # 批量训练的尺寸的大小，每个batch之间不相关
+        entities_size = x.shape[1] # 获取选择的实体数量
 
         # calculate there are how many real entities in each batch
         # tmp_x: [batch_seq_size x entities_size]
-        tmp_x = torch.mean(x, dim=2, keepdim=False)
+        tmp_x = torch.mean(x, dim=2, keepdim=False) # 对实体维度求平均值，如果不存在实体，使用0替代，所以取平均值后会出现
 
         # tmp_y: [batch_seq_size x entities_size]
-        tmp_y = (tmp_x != self.bias_value)
+        tmp_y = (tmp_x != self.bias_value) # 找到有多少个真实的实体，通过不等于0的操作
 
         # entity_num: [batch_seq_size]
-        entity_num = torch.sum(tmp_y, dim=1, keepdim=False)
+        entity_num = torch.sum(tmp_y, dim=1, keepdim=False) # 每个batch对应的实体数量
         del tmp_x, tmp_y
 
         # make sure we can have max to AHP.max_entities - 2 (510)
         # this is we must use a 512 one-hot to represent the entity_nums
         # so we have 0 to 511 entities, meanwhile, the 511 entity we use as a none index
         # so we at most have 510 entities.
+        # 限制组打的实体数量，余下的1个位置有如下作用，必须保证真实实体数量 ≤ 510，这样索引 511 永远是空闲的，可以安全地用作 none 标记：
+        # "空"/"无实体" 的特殊标记（none index）
         entity_num_numpy = np.minimum(AHP.max_entities - 2, entity_num.cpu().numpy())
         entity_num = torch.tensor(entity_num_numpy, dtype=entity_num.dtype, device=entity_num.device)
         del entity_num_numpy
@@ -468,7 +473,7 @@ class EntityEncoder(nn.Module):
         # this means for each batch, there are how many real enetities
         print('entity_num:', entity_num) if debug else None
 
-        # generate the mask for transformer
+        # generate the mask for transformer 制作蒙版，估计作用就是仅对最大实体数量内的数据有效，标记哪些是实体，哪些是padding
         mask = torch.arange(0, self.max_entities).float()
         mask = mask.repeat(batch_size, 1)
 
@@ -476,43 +481,75 @@ class EntityEncoder(nn.Module):
         mask = mask.to(device)
 
         # mask: [batch_size, max_entities]
+        # 通过对比实体数量，位置编号小于实体数量的则为有效的实体，大于实体数量的则为padding
+        # 生成一个bool矩阵
         mask = mask < entity_num.unsqueeze(dim=1)
 
+        '''
+        # x:              (batch, 512, embedding_size)
+        # mask.unsqueeze: (batch, 512, 1)  广播到 (batch, 512, embedding_size)
+        # 结果: padding 实体的所有特征被清零
+        '''
         masked_x = x * mask.unsqueeze(-1)
+        # x中，每个实体潜入编码中的前 max_unit_type 维就是 实体类型（unit type，表示是建筑还是农民还是机枪兵之类的单位）
+        # 的 one-hot 编码（在 preprocess_numpy 中第 238 行拼接在最前面）。这里把它单独切出来，shape 为 (batch, 512, max_unit_type)。
+        # 这里就可以快速知道每个实体的种类
         unit_types = masked_x[:, :, :SCHP.max_unit_type]
         del masked_x
 
         unit_types_one_list = []
-        for i, batch in enumerate(unit_types):
-            unit_types_one = torch.nonzero(batch, as_tuple=True)[-1]
-            unit_types_one = unit_types_one.reshape(1, -1)
+        for i, batch in enumerate(unit_types): # 这里遍历batch中的每个样本
+            unit_types_one = torch.nonzero(batch, as_tuple=True)[-1] # 使用torch.nonzero获取元素中非0索引位置的方式，找到 one-hot 中1的位置
+            unit_types_one = unit_types_one.reshape(1, -1) # 将所有元素1的位置展平
 
+            # entities_size（每个样本的最大样本数量） - entity_num[i]（每个样本的真实的实体数量） = 获取占位符数量
+            # 这里像是构建非实体占位符的潜入编码
             placeholder = torch.ones(entities_size - entity_num[i], dtype=unit_types_one.dtype)
-            placeholder = (placeholder * SCHP.max_unit_type).to(device).reshape(1, -1)
-
-            unit_types_one = torch.cat([unit_types_one, placeholder], dim=1)
+            placeholder = (placeholder * SCHP.max_unit_type).to(device).reshape(1, -1) # 将创建的非实体全1矩阵（每个1代表一个非实体）转换为 SCHP.max_unit_type
+            # placeholder = torch.full((entities_size - entity_num[i],), SCHP.max_unit_type, ...)
+            # 为什么占位符要填 max_unit_type？
+            # 因为上面的one-hot编码中，有一个 max_unit_type 个种类，其中第max_unit_type表示的就是无兵种，表示没有任何选中
+            # max_unit_type 是在兵种编码表里专门多出来的一个"不是任何兵种"的特殊 token。当某个实体槽位是 padding（没有真实单位），它的 unit type 不能填 0（0 是第一个真实兵种，比如 Probe），必须填一个超出所有真实兵种范围的占位值——也就是 max_unit_type。
+ 
+            # 将实体和非实体组合在一起
+            '''
+            unit_types_one: [3, 7, 14, 2, 5, max_unit_type, max_unit_type, ..., max_unit_type]
+                 ↑──────────────────────↑  ↑───────────────────────────────────↑
+                 5 个真实实体的兵种索引        507 个 padding 槽位，统一填 max_unit_type
+            '''
+            unit_types_one = torch.cat([unit_types_one, placeholder], dim=1) 
             unit_types_one_list.append(unit_types_one)
 
             del placeholder
 
-        unit_types_one = torch.cat(unit_types_one_list, dim=0)
+        unit_types_one = torch.cat(unit_types_one_list, dim=0) #  shape 是 (batch_size, max_entities)，即 (batch, 512)，每个位置要么是真实兵种的整数编号，要么是 max_unit_type（≈ 空）。
         del unit_types, unit_types_one_list
 
         # assert the input shape is : batch_seq_size x entities_size x embeding_size
         # note: because the feature size of entity is not equal to 256, so it can not fed into transformer directly.
         # thus, we add a embedding layer to transfer it to right size.
         # x is batch_entities_tensor (dim = 3). Shape: batch_seq_size x entities_size x embeding_size
-        x = self.embedd(x)
+        x = self.embedd(x) # x shape is (batch, 512, original_256)
         print('x.shape:', x.shape) if debug else None
 
         # mask for transformer need a special format
-        mask_seq_len = mask.shape[-1]
-        tran_mask = mask.unsqueeze(1)
+        mask_seq_len = mask.shape[-1] # 由于mask的shape是(batch, 512），那么它这里获取的512，也就是理论上的最大实体数量
+        tran_mask = mask.unsqueeze(1) # shape变成(batch, 1, 512)
 
         # tran_mask: [batch_seq_size x max_entities x max_entities]
-        tran_mask = tran_mask.repeat(1, mask_seq_len, 1)
+        tran_mask = tran_mask.repeat(1, mask_seq_len, 1) # 这里的shape就变成了（batch, 512, 512)
+        # 最终 tran_mask 是一个三维张量。对每个 batch 样本来说，它是一个 512×512 的矩阵，且每一行完全相同：
+        '''
+        tran_mask[0] =
+        [[T,T,T,T,T, F,F,F,...,F],    ← 第 0 行（实体 0 能看到哪些实体）
+        [T,T,T,T,T, F,F,F,...,F],    ← 第 1 行（实体 1 能看到哪些实体）
+        [T,T,T,T,T, F,F,F,...,F],    ← 第 2 行
+        ...
+        [T,T,T,T,T, F,F,F,...,F]]    ← 第 511 行（完全相同！）
+        '''
 
         # out: [batch_seq_size x entities_size x embeding_size]
+        # out 表示 (b, lq/实体数量 512, dim)
         out = self.transformer(x, mask=tran_mask)
         print('out.shape:', out.shape) if debug else None
 

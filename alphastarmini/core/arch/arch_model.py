@@ -139,7 +139,11 @@ class ArchModel(nn.Module):
                 baseline_state=None, baseline_opponent_state=None, 
                 return_baseline=False, multi_gpu_supvised_learning=False,
                 use_scatter_map=True, obs_list=None):
+        '''
+        state: 游戏状态（采集了 entity_state（实体（单位、建筑等）），map_state（小地图（地形、视野等）），statistical_state（标量（资源、科技、计时等））
+        '''
         # shapes of embedded_entity, embedded_spatial, embedded_scalar are all [batch_size x embedded_size]
+        # 对游戏状态中的实体单位进行潜入编码
         entity_embeddings, embedded_entity, entity_nums = self.entity_encoder(state.entity_state)   
 
         if P.skip_entity_list:

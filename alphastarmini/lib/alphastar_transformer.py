@@ -39,6 +39,8 @@ class Transformer(nn.Module):
         #         nn.init.xavier_uniform_(p)
 
     def forward(self, x, mask=None):
+        # enc_output 表示 (b, lq, dim)
+        # *_  表示无论有多少个返回都忽略
         enc_output, *_ = self.encoder(x, mask=mask)
 
         return enc_output
@@ -66,6 +68,7 @@ class Encoder(nn.Module):
 
         enc_output = x
         for enc_layer in self.layer_stack:
+            #  enc_output shape is (b, lq, dim), enc_slf_attn (b, n_head, lq, lq)
             enc_output, enc_slf_attn = enc_layer(enc_output, mask=mask)
 
         del enc_slf_attn
@@ -90,18 +93,20 @@ class EncoderLayer(nn.Module):
         self.ln2 = nn.LayerNorm(d_model, eps=1e-6)
 
     def forward(self, x, mask=None):
+        # att_out shape is (b, lq, dm), enc_slf_attn shape is (b, n_head, lq, lq)
         att_out, enc_slf_attn = self.slf_attn(x, x, x, mask=mask)
 
-        att_out = self.drop1(att_out)
-        out_1 = self.ln1(x + att_out)
+        att_out = self.drop1(att_out) # (b, n_head, lq, lq)
+        out_1 = self.ln1(x + att_out) # 将计算得到的注意力嵌入合并到 x中
 
-        ffn_out = self.pos_ffn(out_1)
+        ffn_out = self.pos_ffn(out_1) # transformer fn层特征提取（融合了注意力权重嵌入）
 
-        ffn_out = self.drop2(ffn_out)
-        out = self.ln2(out_1 + ffn_out)
+        ffn_out = self.drop2(ffn_out) 
+        out = self.ln2(out_1 + ffn_out) # 继续融合特征提取特征
 
         del att_out, out_1, ffn_out
 
+        # out shape is (b, lq, dim), enc_slf_attn (b, n_head, lq, lq)
         return out, enc_slf_attn
 
 
