@@ -141,12 +141,19 @@ class ArchModel(nn.Module):
                 use_scatter_map=True, obs_list=None):
         '''
         state: 游戏状态（采集了 entity_state（实体（单位、建筑等）），map_state（小地图（地形、视野等）），statistical_state（标量（资源、科技、计时等））
+        其他信息具体看md文档,总之这个state小地图每个通道针对不同的特征进行了分配，方便表示不通的特征在小地图上的分布
         '''
         # shapes of embedded_entity, embedded_spatial, embedded_scalar are all [batch_size x embedded_size]
         # 对游戏状态中的实体单位进行潜入编码
+        '''
+        entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示
+        embedded_entity：[batch_size, fc1_output_size]，包含每个样本的总体嵌入表示
+        entity_num：每个样本的有效实体数量
+        unit_types_one：(batch_size, max_entities)，每个样本每个位置的实体类型（比如机枪兵、碉堡亦或者只是个padding）
+        '''
         entity_embeddings, embedded_entity, entity_nums = self.entity_encoder(state.entity_state)   
 
-        if P.skip_entity_list:
+        if P.skip_entity_list: # 消融实现，如果不进行实体嵌入编码效果如何，全部置为0
             entity_embeddings[:] = 0.
             embedded_entity[:] = 0.
 
@@ -159,11 +166,18 @@ class ArchModel(nn.Module):
         print('entity_nums:', entity_nums) if debug else None
         print('entity_nums.shape:', entity_nums.shape) if debug else None
 
+        '''
+        map_skip is (batch, original_128, H / 8， W / 8) 或者 = list, 每个list的元素 shape = batch, original_128, H / 8， W / 8
+        embedded_spatial shape is (batch, original_256)
+        '''
+        # 这里主要是将地图中的实体转换为嵌入或者维持索引状态，然后通过跨通道特征融合提取不同实体之间的关系用于下一步的判断
+        # map_skip 存储的是小地图的空间信息
         if AHP.scatter_channels:
             map_skip, embedded_spatial = self.spatial_encoder(state.map_state, entity_embeddings)
         else:
             map_skip, embedded_spatial = self.spatial_encoder(state.map_state)
 
+        # 这里开始对资源状态信息进行特征提取和编码
         embedded_scalar, scalar_context = self.scalar_encoder(state.statistical_state)
 
         available_actions = state.statistical_state[6]  # available_actions is at position 6

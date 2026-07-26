@@ -52,6 +52,7 @@ class SpatialEncoder(nn.Module):
         self.project_scatter = nn.Conv2d(self.project_inplanes_scatter, original_32, kernel_size=1, stride=1,
                                          padding=0, bias=True)
         # ds means downsampling
+        # 每个卷积都是将输入的特征图尺寸减半
         self.ds_1 = nn.Conv2d(original_32, original_64, kernel_size=4, stride=2,
                               padding=1, bias=True)
         self.ds_2 = nn.Conv2d(original_64, original_128, kernel_size=4, stride=2,
@@ -62,6 +63,7 @@ class SpatialEncoder(nn.Module):
             ResBlock(inplanes=original_128, planes=original_128, stride=1)
             for _ in range(n_resblocks)])
 
+        # 不同的小地图尺寸有不通的fc层
         if AHP == MAHP:
             # note: in mAS, we replace 128x128 to 64x64, and the result 16x16 also to 8x8
             self.fc = nn.Linear(8 * 8 * original_128, original_256)
@@ -79,13 +81,19 @@ class SpatialEncoder(nn.Module):
         return map_data
 
     def scatter(self, scatter_index, entity_embeddings, same_pos_handle='add'):
+        '''
+        scatter_index shape is ([batch_size, 4, H(64), W(64)])  实体索引地图，每个格子存的是该位置实体的编号（不是特征，是索引）,这里是从小地图的特征图切分过来的
+        entity_embeddings: 当前所能看到（采集到）的实体以及嵌入表示 shape is (b, lq/实体数量 512，dim)，表示每个实体类型的编码嵌入
+        '''
         # Note, though this command is called scatter, it actually use the gather function in PyTorch,
         # while 'gather' is an opposite operation of 'scatter'
 
         # `entity_embeddings` are embedded through a size 32 1D convolution, followed by a ReLU,
         # [batch_size x entity_size x embedding_size]
 
-        # [batch_size x entity_size x reduced_embedding_size(e.g. 16)]
+        # [batch_size x entity_size x reduced_embedding_size(e.g. 16)] 
+        # 这里的操作是给实体嵌入编码进行降维，而conv1是要求的输入格式是：[B, 通道数/嵌入维度, 序列长度]，所以需要先挪动，再挪回
+        # reduced_entity_embeddings shape is  (b, lq/实体数量 512，dim32)
         reduced_entity_embeddings = F.relu(self.conv1(entity_embeddings.transpose(1, 2))).transpose(1, 2)
         del entity_embeddings
 
@@ -97,24 +105,32 @@ class SpatialEncoder(nn.Module):
         embed_size = reduced_entity_embeddings.shape[2]
 
         device = next(self.parameters()).device
-        zero_bias = torch.zeros(batch_size, 1, embed_size, device=device)
-        reduced_entity_embeddings = torch.cat([zero_bias, reduced_entity_embeddings[:, 1:, :]], dim=1)
+        zero_bias = torch.zeros(batch_size, 1, embed_size, device=device) # shape (b, 1，dim32) 全零
+        # 将全0矩阵拼接起来，reduced_entity_embeddings shape is (b, 1 + lq/实体数量 512 - 1，dim32)
+        reduced_entity_embeddings = torch.cat([zero_bias, reduced_entity_embeddings[:, 1:, :]], dim=1) 
         print('reduced_entity_embeddings.shape', reduced_entity_embeddings.shape) if debug else None
 
         # [batch_size x 4 x AHP.minimap_size x AHP.minimap_size]
-        scatter_index = scatter_index.reshape(batch_size, -1)
+        scatter_index = scatter_index.reshape(batch_size, -1) # shape is [batch_size, 4 * H * W]
+        # scatter_index.unsqueeze(-1)：[batch_size, 4 * H * W， 1]
+        # .repeat(1, 1, AHP.original_32)： [batch_size, 4 * H * W， AHP.original_32]
         scatter_index = scatter_index.unsqueeze(-1).repeat(1, 1, AHP.original_32)
         # [batch_size x 4 * AHP.minimap_size * AHP.minimap_size x AHP.original_32]
 
         # Question: This has a problem, the first element of index 0 will be averaged everywhere
         # Solution: use zero_bias to remove
+        # scatter_index 中存储的是地图上每个点有哪些实体的索引，通过以下这个转换
+        # 将实体的索引转换为实体的嵌入（一个点可以有多个实体，这里表示一个点可以有4个索引）
         scatter_mid = reduced_entity_embeddings.gather(1, scatter_index.long())
         del reduced_entity_embeddings, scatter_index, zero_bias
         print('scatter_mid', scatter_mid[0, :16, :4]) if debug else None
 
+        # scatter_mid shape (b, 4, map_width, map_height, emb)
         scatter_mid = scatter_mid.reshape(batch_size, self.scatter_volume, 
                                           self.map_width, self.map_width, AHP.original_32)
 
+        # 这里将每个格子的实体嵌入合并，得到每个格子的综合情况嵌入
+        # scatter_result shape (batch, map_width, map_width, emb)
         if same_pos_handle == 'add':
             scatter_result = torch.sum(scatter_mid, dim=1)
         elif same_pos_handle == 'mean':
@@ -122,20 +138,30 @@ class SpatialEncoder(nn.Module):
         else:
             scatter_result = torch.sum(scatter_mid, dim=1)
 
+        # scatter_result shape (batch, emb, map_width, map_width)
         scatter_result = scatter_result.permute(0, 3, 1, 2)
         del scatter_mid
 
         return scatter_result 
 
     def forward(self, x, entity_embeddings=None):
+        '''
+        x: 地图状态是 AlphaStar 架构中三源状态之一的空间/地图状态，它是一个 4D 张量，代表从 SC2 小地图（minimap）提取的多通道空间特征
+        shape [batch_size, 24, 64, 64] （如果是原始则，图像尺寸是128）
+        entity_embeddings: 当前所能看到（采集到）的实体以及嵌入表示 shape is (b, lq/实体数量 512，dim)
+        '''
         device = next(self.parameters()).device
 
         # scatter_map may cause a NaN bug in SL training, now we don't use it
-        if entity_embeddings is not None:
+        if entity_embeddings is not None: # 这里的作用是，如果有实体的嵌入信息，将地图中的每个点实体的索引分类转换为实体的嵌入来表示
             channels = x.shape[1]
 
             # the first 4 channels are scatter map
-            scatter_map, reduced = torch.split(x, [self.scatter_volume, channels - self.scatter_volume], dim=1)
+            # 这行代码把 24 通道的地图状态 x，在通道维度上切成两块：前 4 个通道是实体索引地图（scatter_map），后 20 个通道是普通空间特征（reduced）。前者会被替换成真正的实体嵌入信息，再和后者拼回去继续处理。
+            # scatter_map shape is ([batch_size, 4, 64, 64])  实体索引地图，每个格子存的是该位置实体的编号（不是特征，是索引）
+            # reduced shape is [batch_size, 20, 64, 64] 普通空间特征：camera、height、visibility、creep、entity_owners 等
+            scatter_map, reduced = torch.split(x, [self.scatter_volume, channels - self.scatter_volume], dim=1) # 在dim=1通道数处，切分为scatter_map、reduced两个通道的张量
+            # (batch, emb, map_width, map_width),获取地图中每个点的实体综合信息（因为一个点可能有多个实体）
             scatter_entity = self.scatter(scatter_map, entity_embeddings)
 
             batch_size = scatter_entity.shape[0]
@@ -144,6 +170,8 @@ class SpatialEncoder(nn.Module):
                 reduced = reduced.to('cpu')
                 scatter_entity = scatter_entity.to('cpu')
 
+            # 将获取每个点实体综合嵌入信息的合并回地图状他中
+            # x shape [batch_size, emb32 + 20, 64, 64]
             x = torch.cat([scatter_entity, reduced], dim=1)
 
             if P.handle_cuda_error:  # and batch_size != 1:
@@ -153,6 +181,8 @@ class SpatialEncoder(nn.Module):
 
         # After preprocessing, the planes are concatenated, projected to 32 channels 
         # by a 2D convolution with kernel size 1, passed through a ReLU
+        # 提取特征，通过1x1卷积，实现跨通道的特征融合
+        # 通过卷积后，这里的shape 变成（batch， original_32， H， W）
         if AHP.scatter_channels:
             x = F.relu(self.project_scatter(x))
         else:
@@ -166,7 +196,13 @@ class SpatialEncoder(nn.Module):
         x = F.relu(self.ds_1(x))
         x = F.relu(self.ds_2(x))
         x = F.relu(self.ds_3(x))
+        # x shape （batch, original_128, H / 8， W / 8）
+        # 经过多次下采样和 ResBlock 后，空间细节（精确位置信息）丢失了。而 LocationHead 的任务恰恰是输出"攻击/移动到地图上的哪个坐标"，需要精细的空间信息。
+        # 把 ResBlock 的中间输出保存下来（这就是 map_skip），传给 LocationHead，帮助恢复分辨率时补充细节。本质上就是 U-Net 风格的长跳连接（long skip connection）。
+        # 下方的作用
 
+        # 这段代码是 SpatialEncoder 中 ResBlock 在积累跳连接（skip connection）的两种不同策略
+        # 旧版把所有 ResBlock 输出加和成一个张量；改进版用列表逐层保留。两种方式都是为了给下游的 LocationHead 提供空间细节信息，但粒度不同。版本 1 更接近 AlphaStar 论文，版本 2 更像 U-Net 的标准做法。
         if not self.use_improved_one:
             # 4 ResBlocks with 128 channels and kernel size 3 and applied to the downsampled map, 
             # with the skip connections placed into `map_skip`.
@@ -178,25 +214,32 @@ class SpatialEncoder(nn.Module):
                 # map_skip += x
                 # so we try to change to the follow line, which will not make a in-place operation
                 map_skip = map_skip + x
+            # map_skip shape is (batch, original_128, H / 8， W / 8)
         else:
             # Referenced mostly from "sc2_imitation_learning" project in spatial_decoder
             map_skip = [x]
             for resblock in self.resblock_stack:
                 x = resblock(x)
                 map_skip.append(x)
+            # map_skip = list, 每个list的元素 shape = batch, original_128, H / 8， W / 8
 
         # Compared to AS, we a relu, referred from "sc2_imitation_learning"
         x = F.relu(x)
 
+        # x shape is （batch, original_128 * (H / 8) * (W / 8)）
         x = x.reshape(x.shape[0], -1)
 
         # The ResBlock output is embedded into a 1D tensor of size 256 by a linear layer 
         # and a ReLU, which becomes `embedded_spatial`.
-        x = self.fc(x)
+        x = self.fc(x) # x shape (batch, original_256)
         embedded_spatial = F.relu(x)
 
         del x
 
+        '''
+        map_skip is (batch, original_128, H / 8， W / 8) 或者 = list, 每个list的元素 shape = batch, original_128, H / 8， W / 8
+        embedded_spatial shape is (batch, original_256)
+        '''
         return map_skip, embedded_spatial
 
     @classmethod

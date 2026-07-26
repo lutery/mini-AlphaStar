@@ -549,24 +549,30 @@ class EntityEncoder(nn.Module):
         '''
 
         # out: [batch_seq_size x entities_size x embeding_size]
-        # out 表示 (b, lq/实体数量 512, dim)
+        # out 表示 (b, lq/实体数量 512（最大的实体数量，但是里面并非所有的都算有效实体）, dim)
         out = self.transformer(x, mask=tran_mask)
         print('out.shape:', out.shape) if debug else None
 
         # entity_embeddings: [batch_seq_size x entities_size x conv1_output_size]
+        # F.relu(out).transpose(1, 2)：(b, dim，lq/实体数量 512)
+        # entity_embeddings： (b, lq/实体数量 512，dim)
         entity_embeddings = F.relu(self.conv1(F.relu(out).transpose(1, 2))).transpose(1, 2)
         print('entity_embeddings.shape:', entity_embeddings.shape) if debug else None
 
         # AlphaStar: The mean of the transformer output across across the units (masked by the missing entries) 
         # is fed through a linear layer of size 256 and a ReLU to yield `embedded_entity`
+        # mask.unsqueeze(dim=2) = m[batch_size, max_entities, 1]
+        # masked_out shape is  (b, lq/实体数量 512（最大的实体数量，但是里面并非所有的都算有效实体）, dim)，这样讲padding部分进一步的屏蔽为空
         masked_out = out * mask.unsqueeze(dim=2)
 
         # sum over across the units
         # masked_out: [batch_seq_size x entities_size x embeding_size]
-        # z: [batch_size, embeding_size]
+        # z: [batch_size, embeding_size] 这里将每一个样本数据中所有实体的嵌入相加起来，怎么感觉有点像句子的嵌入： (b, dim)
         z = masked_out.sum(dim=1, keepdim=False)
 
         # here we should dived by the entity_num, not the cls.max_entities
+        # 累加嵌入后，除以真实实体数量，得到一个平均嵌入
+        # entity_num.unsqueeze(dim=1) shape is （b, 实体数量）
         # z: [batch_size, embeding_size]
         z = z / entity_num.unsqueeze(dim=1)
 
@@ -577,6 +583,12 @@ class EntityEncoder(nn.Module):
         embedded_entity = F.relu(self.fc1(z))
         del tran_mask, mask, masked_out, x, out, z
 
+        '''
+        entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示
+        embedded_entity：[batch_size, fc1_output_size]，包含每个样本的总体嵌入表示
+        entity_num：每个样本的有效实体数量
+        unit_types_one：(batch_size, max_entities)，每个样本每个位置的实体类型（比如机枪兵、碉堡亦或者只是个padding）
+        '''
         if return_unit_types:
             return entity_embeddings, embedded_entity, entity_num, unit_types_one
 
