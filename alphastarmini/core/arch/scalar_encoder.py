@@ -282,20 +282,30 @@ class ScalarEncoder(nn.Module):
         return scalar_list
 
     def forward(self, scalar_list):
+        '''
+        scalar_list: 标量列表，在本项目中主要是传入游戏的资源信息：金钱、能源、人口等-玩家自身经济/军事统计
+        '''
+        # 提取各种资源信息，具体看md文档
         [agent_statistics, home_race, away_race, upgrades, enemy_upgrades, time, available_actions, unit_counts_bow,
          mmr, units_buildings, effects, upgrade, beginning_build_order, last_delay, last_action_type,
          last_repeat_queued] = scalar_list
 
-        embedded_scalar_list = []
-        scalar_context_list = []
+        # todo
+        embedded_scalar_list = [] # 将每个标量资源提取映射到emb后存储到该列表中
+        scalar_context_list = [] # todo 这个要存储什么？
 
         # agent_statistics: Embedded by taking log(agent_statistics + 1) and passing through a linear of size 64 and a ReLU
+        # 玩家自身经济/军事统计，10 维向量，对应 SC2 的核心经济军事指标：矿物、瓦斯、已用人口/总人口、农民数、战斗单位数、总单位数等
+        # 神经网络的线性层本质是矩阵乘法 Wx + b，它期望输入在一个稳定、有界的范围内（理想是均值 ≈ 0、标准差 ≈ 1，或至少别差几个数量级）。
+        # 由于这些维度的值非常大，需要用torch log将值下降到可用使用的大小
+        # 因为 log(0) = -∞（负无穷大），而游戏中很多指标的初始值就是 0（瓦斯、某些统计）。+ 1 确保10个维度里面避免有维度是0导致计算出错
         the_log_statistics = torch.log(agent_statistics + 1)
-        x = F.relu(self.statistics_fc(the_log_statistics))
+        x = F.relu(self.statistics_fc(the_log_statistics)) # 提取到玩家自身经济/军事统计的特征
         del agent_statistics, the_log_statistics
         embedded_scalar_list.append(x)
 
         # race: Both races are embedded into a one-hot with maximum 5, and embedded through a linear of size 32 and a ReLU.
+        # 获取自己种族嵌入编码
         x = F.relu(self.home_race_fc(home_race.float()))
         del home_race
         embedded_scalar_list.append(x)
@@ -303,6 +313,7 @@ class ScalarEncoder(nn.Module):
         scalar_context_list.append(x)
 
         # race: Both races are embedded into a one-hot with maximum 5, and embedded through a linear of size 32 and a ReLU.
+        # 获取对手种族的嵌入编码
         x = F.relu(self.away_race_fc(away_race.float()))
         del away_race
         # TODO: During training, the opponent's requested race is hidden in 10% of matches, to simulate playing against the Random race.
@@ -313,17 +324,22 @@ class ScalarEncoder(nn.Module):
         # we add their true race to the observation once we observe one of their units.
 
         # upgrades: The boolean vector of whether an upgrade is present is embedded through a linear of size 128 and a ReLU
+        # 当前已研究的科技升级嵌入编码
         x = F.relu(self.upgrades_fc(upgrades))
         del upgrades
         embedded_scalar_list.append(x)
 
         # enemy_upgrades: Embedded the same as upgrades
+        # 敌人已研究的科技升级嵌入编码
         x = F.relu(self.enemy_upgrades_fc(enemy_upgrades))
         del enemy_upgrades
         embedded_scalar_list.append(x)
 
         # time: A transformer positional encoder encoded the time into a 1D tensor of size 64
         # do it in the preprocess
+        # 游戏时间，不经过线性层，而是用两种编码拼接直接产出 64 维
+        #  前 32 维：game_loop 的二进制编码（比特位展开），后 32 维：game_loop/22.4 转为秒数后做positional encoding
+        # 模型需要知道"现在是第一分钟还是第二十分钟"，这决定开局、中期、后期的策略完全不同
         x = time
         embedded_scalar_list.append(x)
 
@@ -331,6 +347,9 @@ class ScalarEncoder(nn.Module):
         # For example, the agent controls a Stalker and has researched the Blink upgrade, 
         # then the Blink action may be available (even though in practice it may be on cooldown). 
         # The boolean vector of action availability is passed through a linear of size 64 and a ReLU.
+        # 获取当前当前可执行的动作掩码的嵌入，(batch, Actions_Size) — 约 500+ 维
+        # 布尔向量，每位对应一种动作类型（如"造狂热者""闪烁""造星门"），1 = 当前理论上可执行
+        # 代码使用 use_human_knowledge_for_available_actions=True，即基于人类知识判断动作可用性（如：有追猎且有闪烁科技 → 闪烁动作标记为可用，即使正在冷却中），而非依赖游戏 API 的实时状态
         x = F.relu(self.available_actions_fc(available_actions))
         del available_actions
         embedded_scalar_list.append(x)
@@ -340,9 +359,13 @@ class ScalarEncoder(nn.Module):
         # unit_counts_bow: A bag-of-words unit count from `entity_list`. 
         # The unit count vector is embedded by square rooting, passing through a linear layer, and passing through a ReLU
         # note make sure unit_counts_bow all >= 0, otherwise torch.sqrt will produce nan !
+
         print('unit_counts_bow', unit_counts_bow) if debug else None
         assert (unit_counts_bow >= 0).all()
 
+        #       # 场上各单位类型的数量统计，(batch, All_Units_Size) — 约 200+ 维，对应所有可能的单位/建筑类型
+        # 	每个维度的值 = 场上该类型单位的当前数量（如：有 3 个狂热者、1 个星门）
+        # 先 sqrt(x) 压缩大值，再过 Linear(All_Units_Size, 64) + ReLU
         unit_counts_bow = torch.sqrt(unit_counts_bow)
         x = F.relu(self.unit_counts_bow_fc(unit_counts_bow))
         del unit_counts_bow
@@ -350,6 +373,8 @@ class ScalarEncoder(nn.Module):
 
         # mmr: During supervised learning, this is the MMR of the player we are trying to imitate. Elsewhere, this is fixed at 6200. 
         # MMR is mapped to a one-hot of min(mmr / 1000, 6) with maximum 6, then passed through a linear of size 64 and a ReLU
+        # 匹配分（技能等级）MMR（Match Making Rating）的 one-hot 编码。MMR 除以 1000 后取整，cap 在 6。所以 0 代表 0-999 分，6 代表 6000+ 分
+        # 编码的是被模仿的人类玩家的 MMR（让模型学会不同水平的风格）
         x = F.relu(self.mmr_fc(mmr))
         del mmr
         embedded_scalar_list.append(x)
@@ -359,16 +384,24 @@ class ScalarEncoder(nn.Module):
         # That vector is split into 3 sub-vectors of units/buildings, effects, and upgrades, 
         # and each subvector is passed through a linear of size 32 and a ReLU, and concatenated together.
         # The embedding is also added to `scalar_context`
+        #  累计建造过的单位/建筑（累积统计），(batch, All_Units_Size)，布尔向量，每位 = 1 表示曾建造过该类型的单位或建筑（即使已被摧毁）
+        # 告诉模型"我曾经造过星门 → 我可能有空军路线"，这是对全局战略走向的刻画
         x = F.relu(self.units_buildings_fc(units_buildings))
         del units_buildings
         embedded_scalar_list.append(x)
         scalar_context_list.append(x)
 
+        # 当前活跃的状态效果
+        # (batch, Effects_Size) — 约 200+ 维
+        # 布尔向量，每位 = 1 表示该效果当前在场上存在。效果包括：被攻击警告、隐形状态、闪烁冷却、护盾回复、兴奋剂效果等
         x = F.relu(self.effects_fc(effects))
         del effects
         embedded_scalar_list.append(x)
         scalar_context_list.append(x)
 
+        # 累计研究过的科技（累积统计）
+        # (batch, Upgrades_Size)
+        # 与 upgrades（第 4 个）内容相同，都是研究过的科技，但被归入"累积统计"组（与 units_buildings、effects 一起），走不同的处理通道
         x = F.relu(self.upgrade_fc(upgrade))
         del upgrade
         embedded_scalar_list.append(x)
@@ -383,24 +416,39 @@ class ScalarEncoder(nn.Module):
         print("beginning_build_order:", beginning_build_order) if debug else None
         print("beginning_build_order.shape:", beginning_build_order.shape) if debug else None
 
+        # beginning_build_order — 前 20 个建造顺序
+        # (batch, 20, All_Units_Size)
+        # 游戏的前 20 个建造动作，每个位置 one-hot 表示造了什么（第 1 个造了农民，第 2 个造了水晶塔……）
         batch_size = beginning_build_order.shape[0]
 
+        # 这里是创建一个位置序号，为每一个位置序号创建one-hot编码
         seq = torch.arange(SCHP.count_beginning_build_order)
-        seq = L.tensor_one_hot(seq, SCHP.count_beginning_build_order)
-        seq = seq.unsqueeze(0).repeat(batch_size, 1, 1).to(beginning_build_order.device)
+        seq = L.tensor_one_hot(seq, SCHP.count_beginning_build_order) # 将序列转换为one-hot编码，shape is （SCHP.count_beginning_build_order，SCHP.count_beginning_build_order）
+        # seq.unsqueeze(0)：（1，  SCHP.count_beginning_build_order，SCHP.count_beginning_build_order）
+        # .repeat(batch_size, 1, 1)：（batch_size，  SCHP.count_beginning_build_order，SCHP.count_beginning_build_order）
+        seq = seq.unsqueeze(0).repeat(batch_size, 1, 1).to(beginning_build_order.device) # 
 
-        bo_sum = beginning_build_order.sum(dim=-1, keepdim=False)
-        bo_sum = bo_sum.sum(dim=-1, keepdim=False)
-        bo_sum = bo_sum.unsqueeze(1)
-        bo_sum = bo_sum.repeat(1, SCHP.count_beginning_build_order)
+        # 为前 20 个建造步骤创建一个 padding 掩码（mask）。不是每局游戏都恰好有 20 个建造动作——游戏刚开始时可能只造了 3 个东西，剩下 17 个位置是空的（全零填充）。这个 mask 告诉后续的 Transformer："哪些位置有真实数据，哪些是 padding，处理时请忽略 padding。
+        bo_sum = beginning_build_order.sum(dim=-1, keepdim=False) # bo_sum: (batch, 20)，每个位置是一个 one-hot 向量（只有一个 1，其余为 0）。求和后有真实建筑的不为0，有建筑的为0
+        bo_sum = bo_sum.sum(dim=-1, keepdim=False) # 沿最后一个维度（20 个位置）求和，shape is (batch,)，将每个位置的 0/1 加起来，得到该样本一共有多少个真实的建造动作。
+        bo_sum = bo_sum.unsqueeze(1) # shape is (batch, 1),举例：[5, 12, 0] → [[5], [12], [0]]
+        bo_sum = bo_sum.repeat(1, SCHP.count_beginning_build_order) # 操作: 沿维度 1 重复 count_beginning_build_order 次, shape is (batch, 20)
 
-        mask = torch.arange(SCHP.count_beginning_build_order)
+        mask = torch.arange(SCHP.count_beginning_build_order) # mask shape (SCHP.count_beginning_build_order,) 序列
+        # mask.unsqueeze(0): (1, SCHP.count_beginning_build_order)
+        # .repeat(batch_size, 1)：(batch_size, SCHP.count_beginning_build_order)
         mask = mask.unsqueeze(0).repeat(batch_size, 1).to(bo_sum.device)
+        # 通过这种对比的方式，按照每个样本已经建筑建筑的数量，获取有效建筑的bool掩码
+        # (batch_size, SCHP.count_beginning_build_order) 1的位置表示有效建筑，0的位置表示padding
         mask = mask < bo_sum
+        # mask.unsqueeze(2)：(batch_size, SCHP.count_beginning_build_order， 1) 
+        # .repeat(1, 1, SCHP.count_beginning_build_order)：(batch_size, SCHP.count_beginning_build_order， SCHP.count_beginning_build_order) 
         mask = mask.unsqueeze(2).repeat(1, 1, SCHP.count_beginning_build_order)
 
         # add the seq info, referenced by the processing way of DI-star
+        # 后面将每一个顺序及按照的建筑类型，加上序号的one-hot编码进行拼接，可能是增加位置顺序信息
         x = torch.cat([beginning_build_order, seq], dim=2)
+        # 提取前20个建造建筑的信息嵌入编码
         x = self.before_beginning_build_order(x)
 
         # like in entity encoder, we add a sequence mask
