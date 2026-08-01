@@ -292,7 +292,19 @@ class ScalarEncoder(nn.Module):
 
         # todo
         embedded_scalar_list = [] # 将每个标量资源提取映射到emb后存储到该列表中
-        scalar_context_list = [] # todo 这个要存储什么？
+        scalar_context_list = [] # 精选出来的信息，
+        '''
+        home_race	种族决定了可用兵种/建筑池。你是 Protoss，就不能造机枪兵。门控可以屏蔽掉其他种族专属的动作特征
+        away_race	对手种族影响战术选择。对面是 Zerg 时防一波狗/毒爆相关动作应增强
+        available_actions	最直接的约束——你连星门都没有，"造虚空"这个动作维度就应该被压到几乎不可能
+        units_buildings	你造过什么建筑？有星门→空军可选。累积建造历史塑造了你的科技树路线
+        effects	当前状态效果。闪烁在冷却？那么闪烁动作相关维度降权。被攻击中？撤回/防御动作升权
+        upgrade	研究过什么科技（累积）。有"冲锋"科技→狂热者的冲锋相关战术可选
+        beginning_build_order	开局路线。前 3 个建筑是"双气开"还是"速二基地"→完全不同的中期动作分布
+
+        主要是用来对AI的可用的动作空间进行约束，避免选择一些无效的动作
+        
+        '''
 
         # agent_statistics: Embedded by taking log(agent_statistics + 1) and passing through a linear of size 64 and a ReLU
         # 玩家自身经济/军事统计，10 维向量，对应 SC2 的核心经济军事指标：矿物、瓦斯、已用人口/总人口、农民数、战斗单位数、总单位数等
@@ -452,7 +464,10 @@ class ScalarEncoder(nn.Module):
         x = self.before_beginning_build_order(x)
 
         # like in entity encoder, we add a sequence mask
+        # 这里实在计算开头前20个建筑中每个建筑的互相影响如何，估计这个必要重要
+        # 不过感觉也可以计算出历史所有建筑的互相影响情况
         x = self.beginning_build_order_transformer(x, mask=mask)
+        # x shape is (batch, SCHP.count_beginning_build_order * self.build_order_model_size)
         x = x.reshape(x.shape[0], SCHP.count_beginning_build_order * self.build_order_model_size)
 
         embedded_scalar_list.append(x)
@@ -462,12 +477,16 @@ class ScalarEncoder(nn.Module):
         # last_delay: The delay between when we last acted and the current observation, in game steps. 
         # This may be different from what we requested due to network latency or APM limits. 
         # It is encoded into a one-hot with maximum 128 and passed through a linear of size 64 and a ReLU
+        # last_delay shape is (batch, 128),one-hot 编码，表示上次发出动作到现在经过了多少个 game_step
+        # 由于网络延迟和 APM 限制，玩家不能每帧都发指令。这个特征告诉模型"我多久没动作了"，影响动作时机判断
         x = F.relu(self.last_delay_fc(last_delay))
         del last_delay
         embedded_scalar_list.append(x)
 
         # last_action_type: The last action type is encoded into a one-hot with maximum equal 
         # to the number of possible actions, and passed through a linear of size 128 and a ReLU
+        # last_action_type shape is (batch, Actions_Size) — 约 500+ 维
+        # one-hot 编码，表示上一次执行的动作是什么类型（移动、攻击、建造、闪烁……）
         x = F.relu(self.last_action_type_fc(last_action_type))
         del last_action_type
         embedded_scalar_list.append(x)
@@ -475,10 +494,15 @@ class ScalarEncoder(nn.Module):
         # last_repeat_queued: Some other action arguments (queued and repeat) are one-hots with 
         # maximum equal to the number of possible values for those arguments, 
         # and jointly passed through a linear of size 256 and ReLU
+        # last_repeat_queued shape is 	(batch, 2)
+        # 两个布尔值的 one-hot 表示：
+        # • queued：上次动作是否以 shift+click 队列方式发出
+        # • repeat：上次动作是否是重复指令（如按住快捷键连发）
         x = F.relu(self.last_repeat_queued_fc(last_repeat_queued))
         del last_repeat_queued
         embedded_scalar_list.append(x)
 
+        # 将所有的游戏的资源信息嵌入信息组合起来，并提取特征
         embedded_scalar = torch.cat(embedded_scalar_list, dim=1)
         embedded_scalar_out = F.relu(self.fc_1(embedded_scalar))
 
@@ -487,6 +511,8 @@ class ScalarEncoder(nn.Module):
 
         del x, embedded_scalar_list, scalar_context_list, embedded_scalar, scalar_context
 
+        # embedded_scalar_out 所有游戏资源信息提取后的信息
+        # scalar_context_list 是从 16 个标量特征中精选出来的 7 个，专门用于在 ActionTypeHead 中做"门控"——它们不参与 LSTM 的序列记忆，而是像一个"条件开关"，根据游戏上下文动态调节动作选择。
         return embedded_scalar_out, scalar_context_out
 
 
