@@ -178,26 +178,37 @@ class ArchModel(nn.Module):
             map_skip, embedded_spatial = self.spatial_encoder(state.map_state)
 
         # 这里开始对资源状态信息进行特征提取和编码
+        # 将游戏的一些资源信息编码为嵌入，方便计算
         embedded_scalar, scalar_context = self.scalar_encoder(state.statistical_state)
 
-        available_actions = state.statistical_state[6]  # available_actions is at position 6
+        available_actions = state.statistical_state[6]  # available_actions is at position 6 可用的动作，因为星际争霸有些动作需要以来游戏进度和建筑才能执行
         print('available_actions:', available_actions) if debug else None
         print('available_actions.shape:', available_actions.shape) if debug else None
 
         del state
 
+        '''
+        lstm_output: (batch_size * sequence_length, hidden_dim) 
+        hidden_state: 一个元组 (h_n, c_n)，分别是隐藏状态和细胞状态。
+        '''
         lstm_output, hidden_state = self.core(embedded_scalar, embedded_entity, embedded_spatial, 
                                               batch_size, sequence_length, hidden_state)
         print('lstm_output.shape:', lstm_output.shape) if debug else None
         print('lstm_output is nan:', torch.isnan(lstm_output).any()) if debug else None
 
+        '''
+        action_type_logits: 预测选择动作的logits分布 shape (batch, max_action_num)
+        action_type: 选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
+        autoregressive_embedding: 动作 + 局势"的联合表示 shape （batch， autoregressive_embedding_size）
+        '''
         action_type_logits, action_type, autoregressive_embedding = self.action_type_head(lstm_output, scalar_context, available_actions)
-        if P.skip_autoregressive_embedding:
+        if P.skip_autoregressive_embedding: # 如果开启了跳过动作 + 局势的联合嵌入表示，则将这个嵌入表示为0
             autoregressive_embedding = autoregressive_embedding - autoregressive_embedding
             autoregressive_embedding[:] = 0.
             #print('forward delay autoregressive_embedding', autoregressive_embedding) if 0 else None
             print('forward delay autoregressive_embedding.shape', autoregressive_embedding.shape) if 0 else None
 
+        # 打印配置开关
         print('action_type_logits:', action_type_logits) if debug else None
         print('action_type_logits.shape:', action_type_logits.shape) if debug else None
 
