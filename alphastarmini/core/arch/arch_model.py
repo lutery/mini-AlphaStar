@@ -142,6 +142,8 @@ class ArchModel(nn.Module):
         '''
         state: 游戏状态（采集了 entity_state（实体（单位、建筑等）），map_state（小地图（地形、视野等）），statistical_state（标量（资源、科技、计时等））
         其他信息具体看md文档,总之这个state小地图每个通道针对不同的特征进行了分配，方便表示不通的特征在小地图上的分布
+
+        obs_list:obs_list 是一个可选的 Python 列表，装有原始 PySC2 观测字典（不是 ScalarEncoder 处理过的标量特征）,没有经过处理提取的特征信息
         '''
         # shapes of embedded_entity, embedded_spatial, embedded_scalar are all [batch_size x embedded_size]
         # 对游戏状态中的实体单位进行潜入编码
@@ -218,12 +220,18 @@ class ArchModel(nn.Module):
         print('autoregressive_embedding:', autoregressive_embedding) if debug else None
         print('autoregressive_embedding.shape:', autoregressive_embedding.shape) if debug else None       
 
+        # 主动根据选择的动作，从观察列表中判断执行动作能够影响到选择到的实体掩码
         if obs_list is not None:
             unit_type_entity_mask = L.get_batch_unit_type_mask(action_type.squeeze(dim=1), obs_list)
             unit_type_entity_mask = torch.tensor(unit_type_entity_mask, dtype=torch.bool, device=action_type.device)     
         else:
             unit_type_entity_mask = None
 
+        '''
+        delay_logits: 预测操作延迟的logits分布
+        delay： 实际的操作延迟（采样或者外部传入的专家）
+        autoregressive_embedding：在原先游戏资源、地图信息等选择预测的动作+局势的嵌入表示继续增加了操作延迟（下一次什么时候在预测动作操作）的信息
+        '''
         delay_logits, delay, autoregressive_embedding = self.delay_head(autoregressive_embedding)
         if P.skip_autoregressive_embedding:
             autoregressive_embedding = autoregressive_embedding - autoregressive_embedding

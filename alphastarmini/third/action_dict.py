@@ -9,6 +9,11 @@ Copyright 2020 Sensetime X-lab. All Rights Reserved
 import numpy as np
 from copy import deepcopy
 
+'''
+selected_units：这个动作是否需要选中单位（True/False）
+target_units / target_location：是否需要目标单位 / 目标位置
+avail_unit_type_id：能执行这个动作的兵种 ID 列表（和 ACTIONS_STAT 的 selected_type 语义几乎一样）
+'''
 ACTION_INFO_MASK = \
     {
         0: {'name': 'no_op', 'func_type': 'raw_no_op', 'ability_id': None, 'general_id': None, 'goal': 'other', 'special_goal': None, 'queued': False, 'selected_units': False, 'target_units': False, 'target_location': False},
@@ -576,6 +581,13 @@ ACTION_INFO_MASK = \
         562: {'name': 'UnloadUnit_WarpPrism_quick', 'func_type': 'raw_cmd', 'ability_id': 914, 'general_id': 3796, 'goal': 'other', 'special_goal': None, 'queued': True, 'selected_units': True, 'target_units': False, 'target_location': False, 'avail_unit_type': ['PROTOSS_WARPPRISM', 'PROTOSS_WARPPRISMPHASING'], 'avail_unit_type_id': [81, 136]},
     }
 
+'''
+字段	含义
+action_name	动作名，如 Train_Zealot_quick
+selected_type	该动作可以"选中/指挥"的兵种 ID 列表（SC2 原始 ID，不是 mAS 内部索引）
+target_type	该动作可以"作用/攻击"的目标兵种 ID 列表
+selected_type_name / target_type_name	对应的兵种名字（纯可读性用途）
+'''
 ACTIONS_STAT = {
     0: {'action_name': 'no_op', 'selected_type': [], 'target_type': [], 'selected_type_name': [], 'target_type_name': []},
     1: {'action_name': 'Smart_pt', 'selected_type': [311, 801, 1955, 79, 4, 76, 694, 733, 62, 75, 83, 10, 488, 59, 82, 1911, 495, 78, 66, 84, 894, 71, 77, 1910, 74, 67, 496, 80, 81, 136, 73, 31, 55, 21, 46, 57, 24, 18, 36, 692, 27, 43, 50, 144, 53, 484, 689, 734, 268, 51, 48, 54, 23, 132, 134, 130, 11, 56, 49, 1913, 45, 33, 32, 28, 44, 52, 691, 34, 35, 498, 500, 9, 115, 8, 114, 113, 289, 12, 15, 14, 13, 17, 16, 103, 112, 104, 116, 86, 101, 107, 117, 94, 7, 120, 150, 111, 127, 100, 489, 693, 502, 503, 504, 501, 108, 142, 95, 106, 893, 892, 129, 128, 1912, 824, 126, 125, 688, 690, 687, 110, 118, 97, 98, 139, 99, 140, 494, 493, 109, 131, 499, 105, 119], 'target_type': [], 'selected_type_name': ['Adept', 'AdeptPhaseShift', 'AssimilatorRich', 'Carrier', 'Colossus', 'DarkTemplar', 'Disruptor', 'DisruptorPhased', 'Gateway', 'HighTemplar', 'Immortal', 'Mothership', 'MothershipCore', 'Nexus', 'Observer', 'ObserverSurveillanceMode', 'Oracle', 'Phoenix', 'PhotonCannon', 'Probe', 'PylonOvercharged', 'RoboticsFacility', 'Sentry', 'ShieldBattery', 'Stalker', 'Stargate', 'Tempest', 'VoidRay', 'WarpPrism', 'WarpPrismPhasing', 'Zealot', 'AutoTurret', 'Banshee', 'Barracks', 'BarracksFlying', 'Battlecruiser', 'Bunker', 'CommandCenter', 'CommandCenterFlying', 'Cyclone', 'Factory', 'FactoryFlying', 'Ghost', 'GhostAlternate', 'Hellion', 'Hellbat', 'Liberator', 'LiberatorAG', 'MULE', 'Marauder', 'Marine', 'Medivac', 'MissileTurret', 'OrbitalCommand', 'OrbitalCommandFlying', 'PlanetaryFortress', 'PointDefenseDrone', 'Raven', 'Reaper', 'RepairDrone', 'SCV', 'SiegeTank', 'SiegeTankSieged', 'Starport', 'StarportFlying', 'Thor', 'ThorHighImpactMode', 'VikingAssault', 'VikingFighter', 'WidowMine', 'WidowMineBurrowed', 'Baneling', 'BanelingBurrowed', 'BanelingCocoon', 'BroodLord', 'BroodLordCocoon', 'Broodling', 'Changeling', 'ChangelingMarine', 'ChangelingMarineShield', 'ChangelingZealot', 'ChangelingZergling', 'ChangelingZerglingWings', 'Cocoon', 'Corruptor', 'Drone', 'DroneBurrowed', 'Hatchery', 'Hive', 'Hydralisk', 'HydraliskBurrowed', 'InfestationPit', 'InfestedTerran', 'InfestedTerranBurrowed', 'InfestedTerranCocoon', 'Infestor', 'InfestorBurrowed', 'Lair', 'Locust', 'LocustFlying', 'Lurker', 'LurkerBurrowed', 'LurkerDen', 'LurkerCocoon', 'Mutalisk', 'NydusCanal', 'NydusNetwork', 'Overlord', 'OverlordTransport', 'OverlordTransportCocoon', 'Overseer', 'OverseerCocoon', 'OverseerOversightMode', 'ParasiticBombDummy', 'Queen', 'QueenBurrowed', 'Ravager', 'RavagerBurrowed', 'RavagerCocoon', 'Roach', 'RoachBurrowed', 'RoachWarren', 'SpineCrawler', 'SpineCrawlerUprooted', 'SporeCrawler', 'SporeCrawlerUprooted', 'SwarmHost', 'SwarmHostBurrowed', 'Ultralisk', 'UltraliskBurrowed', 'Viper', 'Zergling', 'ZerglingBurrowed'], 'target_type_name': []},
@@ -930,6 +942,9 @@ def merge_judge(target_general_action, val):
     return ret[0]
 
 
+'''
+GENERAL_ACTION_INFO_MASK 的定义：从 ACTION_INFO_MASK 中只挑出 general_id 为 None 或 0 的条目（即"代表动作"本身），构成子集
+'''
 GENERAL_ACTION_INFO_MASK = {}
 ACT_TO_GENERAL_ACT = {}
 ACT_TO_GENERAL_ACT_ARRAY = np.full(max(ACTION_INFO_MASK.keys()) + 1, -1, dtype=np.int)

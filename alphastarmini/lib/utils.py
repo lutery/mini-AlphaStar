@@ -238,22 +238,33 @@ def calculate_build_order(previous_bo, obs, next_obs):
 
 def get_batch_unit_type_mask(action_types, obs_list):
     # inpsired by the DI-Star project
+    '''
+    根据选择的动作和观察列表，选择可以选择的实体掩码，其中1代表该实体是可以被当前动作选中的，对应之前的实体嵌入编码
+    ACTIONS_STAT 和 GENERAL_ACTION_INFO_MASK 是两张**"动作 → 可用兵种"的静态先验查表**；get_batch_unit_type_mask 则是把这两张表结合当前这局游戏里实际存在的单位，算出一个 "哪些实体槽位对当前动作合法（可以被选中）"的掩码，用来在 selected_units_head 里做 masked softmax，防止网络选中非法单位。
+    '''
 
     unit_type_mask_list = []
-    for idx, action in enumerate(action_types):
-        action = action.item()
+    for idx, action in enumerate(action_types): # 遍历每一个样本选择的动作
+        action = action.item() # 将张量转换为标量（也就是python的数据类型）,0 ~ 563 之间的动作 ID
         print('action', action) if debug else None
+
+        # # 步骤 1：查表——这个动作类型需要"选中单位"吗？
         info_1 = {"selected_units": False, "avail_unit_type_id": []} 
         if action in AD.GENERAL_ACTION_INFO_MASK:
             info_1 = AD.GENERAL_ACTION_INFO_MASK[action]
             print('info_1', info_1) if debug else None
+            # 例如：action = "建造星门" → selected_units=True, avail_unit_type_id=[Probe的ID]
+
+        # 步骤 2：查表——这个动作类型对应的实体类型有哪些？
         info_2 = {"selected_type": []}
         if action in AD.ACTIONS_STAT:
             info_2 = AD.ACTIONS_STAT[action]
             print('info_2', info_2) if debug else None
 
+        # 步骤 3：如果不需要选单位，掩码全为 0（没有候选实体）
         unit_type_mask = np.zeros([1, AHP.max_entities])
         if info_1["selected_units"]:
+            # # 步骤 4：合并两个来源的类型 ID
             set_1 = set(info_1["avail_unit_type_id"])
             set_2 = set(info_2["selected_type"])
             del info_1, info_2
@@ -261,8 +272,11 @@ def get_batch_unit_type_mask(action_types, obs_list):
             del set_1, set_2
             print('set all', set_all) if debug else None
 
+            # 步骤 5：从原始观测中取出场上所有实体的 unit_type
             raw_units_types = obs_list[idx]["raw_units"][:, FeatureUnit.unit_type]
+            # 例如：场上有一个 Probe(type=84)、一个 Nexus(type=109)、一个 Zealot(type=73)
             for i, t in enumerate(raw_units_types):
+                 # 步骤 6：逐个检查每个实体，类型在 set_all 中 → 掩码为 1
                 if t in set_all and i < AHP.max_entities:
                     unit_type_mask[0, i] = 1
             del raw_units_types
@@ -270,7 +284,7 @@ def get_batch_unit_type_mask(action_types, obs_list):
 
     unit_type_masks = np.concatenate(unit_type_mask_list, axis=0)
     del unit_type_mask_list
-    return unit_type_masks
+    return unit_type_masks # [batch_size, AHP.max_entities]
 
 
 def calculate_build_order_numpy(previous_bo, obs, next_obs):
