@@ -39,6 +39,7 @@ speed = True
 def unit_tpye_to_unit_type_index(unit_type):
     ''' 
     transform unique unit type in SC2 to unit index in one hot represent in mAS.
+    游戏单位对象的类型转换为index索引值
     '''
     unit_type_index = get_unit_tpye_index_fast(unit_type)
     del unit_type
@@ -54,12 +55,14 @@ def get_unit_tpye_name_and_race(unit_type):
             pass  # Wrong race.
 
 
+# 将游戏的各个种族的单位合并起来，这里的类型估计是一个非序列的数字
 n = [item.value for item in Neutral]
 p = [item.value for item in Protoss]
 t = [item.value for item in Terran]
 z = [item.value for item in Zerg]
 
 all_list = n + p + t + z
+# 根据合并种族的集合，创建一个index列表索引，每一个索引值代表一个种族的类型（从0开始的序列）
 all_dict = dict(zip(all_list, range(0, len(all_list))))
 all_dict_inv = {v: k for k, v in all_dict.items()}
 
@@ -86,21 +89,22 @@ def get_buff_from_index(index):
 
 
 # we modify the DI-Star original file to the one we can use
+# 第一维度：动作类型索引；第二维度：能够操作对象类型的掩码，1表示可以操作，0表示不可以操作
 SELECTED_UNITS_TYPES_MASK = torch.zeros(ConstSize.Actions_Size, ConstSize.All_Units_Size)
 TARGET_UNITS_TYPES_MASK = torch.zeros(ConstSize.Actions_Size, ConstSize.All_Units_Size)
 
-for i in range(ConstSize.Actions_Size):
-    action_stat = AD.ACTIONS_STAT.get(i, None)
+for i in range(ConstSize.Actions_Size): # 遍历所有可能的动作
+    action_stat = AD.ACTIONS_STAT.get(i, None) # 从动作*对象类型表中，根据动作选择能够操作的对象类型，如果不存在责返回None
     if action_stat is not None:
         print('i', i, 'action_name', action_stat['action_name']) if debug else None
 
-        type_set = set(action_stat['selected_type'])
+        type_set = set(action_stat['selected_type']) # 获取能够选择的对象类型集合 SC2 原始兵种 ID 集合
         print('selected_type type_set', type_set) if debug else None
 
         reorder_type_list = [unit_tpye_to_unit_type_index(j) for j in type_set]
         print('reorder_type_list', reorder_type_list) if debug else None
 
-        SELECTED_UNITS_TYPES_MASK[i, reorder_type_list] = 1
+        SELECTED_UNITS_TYPES_MASK[i, reorder_type_list] = 1 # 根据对象类型转换为对象索引后，将对应位置的设置为1，代表当前动作，指定的类型是可以被选择使用的
 
         type_set = set(action_stat['target_type'])
         print('target_type type_set', type_set) if debug else None
@@ -462,7 +466,7 @@ def to_one_hot(y, n_dims=None):
 def action_can_be_queued(action_type):
     """
     test the action_type whether can be queued
-
+    这里是i通过动作的索引，获取该动作的属性，然后从提取动作的queue属性，如果有则是可以排队的动作，如果没有则是不可排队的动作
     Inputs: action_type, int
     Outputs: true or false
     """
@@ -479,17 +483,18 @@ def action_can_be_queued_mask(action_types):
     """
     test the action_type whether can be queued
 
-    Inputs: action_types
+    Inputs: action_types 选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
     Outputs: mask
+    这个动作在游戏引擎里的原始定义中，参数列表里到底有没有 queued 参数。有 → mask=1，queue 编码正常写回；没有（如 no_op、move_camera）→ mask=0，mask * t 全零，embedding 原封不动。
     """
-    mask = torch.zeros_like(action_types).bool()
+    mask = torch.zeros_like(action_types).bool() # 构建一个mask全零矩阵，shape is (batch, 1)，其中1表示该动作是需要排队执行；0表示该动作是无需排队执行
     action_types = action_types.cpu().detach().numpy()
 
     for i, action_type in enumerate(action_types):
         action_type_index = action_type.item()
         print('i:', i, 'action_type_index:', action_type_index) if debug else None
 
-        mask[i] = action_can_be_queued(action_type_index)
+        mask[i] = action_can_be_queued(action_type_index) # 判断对动作是否可以需要排队执行，排队是1，立即执行是0
         del action_type, action_type_index
 
     del action_types
@@ -658,6 +663,7 @@ def action_can_apply_to_entity_types_mask(action_types):
 def action_can_apply_to_selected_mask(action_types):
     """
     find the entity_types which the action_type can be applied to
+    根据实际选择的动作action_types获取该动作能够操作对象的掩码
 
     # Updated in mAS 1.06
     # By the action_dict from the DI-Star project, we can implement
@@ -668,6 +674,7 @@ def action_can_apply_to_selected_mask(action_types):
     Outputs: mask
     """
 
+    # mask shape （batch， ConstSize.All_Units_Size），其中0表示不可操作对象类型，1表示可以操作对象类型
     mask = SELECTED_UNITS_TYPES_MASK[action_types.squeeze(1)].to(action_types.device)
     del action_types
 

@@ -230,13 +230,20 @@ class ArchModel(nn.Module):
         '''
         delay_logits: 预测操作延迟的logits分布
         delay： 实际的操作延迟（采样或者外部传入的专家）
-        autoregressive_embedding：在原先游戏资源、地图信息等选择预测的动作+局势的嵌入表示继续增加了操作延迟（下一次什么时候在预测动作操作）的信息
+        autoregressive_embedding：在原先游戏资源、地图信息等选择预测的动作+局势的嵌入表示继续增加了操作延迟（下一次什么时候在预测动作操作）的信息 （batch， autoregressive_embedding_size）
         '''
         delay_logits, delay, autoregressive_embedding = self.delay_head(autoregressive_embedding)
         if P.skip_autoregressive_embedding:
             autoregressive_embedding = autoregressive_embedding - autoregressive_embedding
             autoregressive_embedding[:] = 0.
 
+
+        
+        '''
+        queue_logits: 根据autoregressive_embedding判断接下来的动作是排队还是立即执行 （batch，max_queue）
+        queue: 针对queue_logits的采样或者外部传入的专家数据 （batch，1）
+        autoregressive_embedding: 游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size）
+        '''
         queue_logits, queue, autoregressive_embedding = self.queue_head(autoregressive_embedding, action_type, embedded_entity)
         if P.skip_autoregressive_embedding:
             autoregressive_embedding = autoregressive_embedding - autoregressive_embedding

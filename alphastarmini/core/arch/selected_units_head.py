@@ -30,6 +30,10 @@ class SelectedUnitsHead(nn.Module):
             repeated for each of the possible 64 unit selections
         units - The units selected for this action.
         autoregressive_embedding - Embedding that combines information from `lstm_output` and all previous sampled arguments.
+
+    是一个**"序列式实体选择器"（pointer-network 风格）：给定动作类型和场上所有实体的嵌入，它逐个、最多 12 次**挑选要选中的单位（每轮只选一个，选过的不能再选，可以中途选一个特殊的"结束符"EOF 提前终止），并在每轮之间用一个小 LSTM 记住"已经选了谁"，从而支持"一次框选多个单位"这种星际操作。
+
+    
     '''
 
     def __init__(self, embedding_size=AHP.entity_embedding_size, 
@@ -75,6 +79,12 @@ class SelectedUnitsHead(nn.Module):
 
     def forward(self, autoregressive_embedding, action_type, entity_embeddings, entity_num, unit_type_entity_mask=None):
         '''
+        autoregressive_embedding: 游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size）
+        action_type: 选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
+        entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示
+        entity_num：每个样本的有效实体数量
+        unit_type_entity_mask：主动根据选择的动作，从观察列表中判断执行动作能够影响到选择到的实体掩码
+
         Inputs:
             autoregressive_embedding: [batch_size x autoregressive_embedding_size]
             action_type: [batch_size x 1]
@@ -97,16 +107,21 @@ class SelectedUnitsHead(nn.Module):
         # QUESTION: one unit type or serveral unit types?
         # ANSWER: serveral unit types, each for one-hot
         # This is some places which introduce much human knowledge
+        # （batch， ConstSize.All_Units_Size），其中0表示不可操作对象类型，1表示可以操作对象类型
         unit_types_one_hot = L.action_can_apply_to_selected_mask(action_type).to(device)
 
         # the_func_embed shape: [batch_size x 256]
+        # 提取聚合到一个执行动作->可选择对象类型的特征嵌入
+        # shape is (batch_size, original_256)
         the_func_embed = F.relu(self.func_embed(unit_types_one_hot))
         del unit_types_one_hot
 
         # AlphaStar: It also computes a mask of which units can be selected, initialised to allow selecting all entities 
         # that exist (including enemy units).
         # generate the length mask for all entities
+        # mask shape is (entity_size，)
         mask = torch.arange(entity_size, device=device).float()
+        # mask shape is (batch_size, entity_size，)
         mask = mask.repeat(batch_size, 1)
 
         # now the entity nums should be added 1 (including the EOF)
