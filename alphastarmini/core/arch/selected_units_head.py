@@ -33,7 +33,14 @@ class SelectedUnitsHead(nn.Module):
 
     是一个**"序列式实体选择器"（pointer-network 风格）：给定动作类型和场上所有实体的嵌入，它逐个、最多 12 次**挑选要选中的单位（每轮只选一个，选过的不能再选，可以中途选一个特殊的"结束符"EOF 提前终止），并在每轮之间用一个小 LSTM 记住"已经选了谁"，从而支持"一次框选多个单位"这种星际操作。
 
-    
+    SC2 的一条指令里，unit_tags 参数可能包含多个单位（比如框选 12 个农民去采气、选中 6 个 Gateway 一起出狂徒）。这意味着模型输出不是一个单位 ID，而是一个长度可变的单位序列：
+    选中集合 = [单位₅, 单位₉, 单位₁₃, （结束）]     ← 序列长度由模型自己决定
+
+    这就引出三个子问题，也是本文件的三个核心机制：
+
+        选几个？ → 用 EOF（End-Of-File，序列生成里叫 EOS）特殊符号：模型随时可以选"结束"来终止；
+        先后依赖？ → 选第 2 个时要"记得"已选了第 1 个（不能重复、且策略上比如"选中了基地就该继续选农民"）→ 小 LSTM 维护记忆；
+        什么能选？ → 三重约束：长度掩码（场上实际存在的实体）、类型先验（func_embed 软引导 + 可选实体掩码硬屏蔽）、去重掩码。
     '''
 
     def __init__(self, embedding_size=AHP.entity_embedding_size, 
@@ -47,8 +54,15 @@ class SelectedUnitsHead(nn.Module):
         self.temperature = temperature
 
         self.max_number_of_unit_types = max_number_of_unit_types
+        # 动作→合法兵种类型的先验注入，这里是注入当前选择要执行的动作所能操作对象类型的矩阵
+        # 得到这个可操作对象矩阵的嵌入表示
         self.func_embed = nn.Linear(max_number_of_unit_types, original_256)  # with relu
 
+        # PyTorch 的 Conv1d 规定输入必须是 [batch, channels, length]——通道维（channels）在倒数第二维，序列长度在最后一维。
+        # kernel_size=1 意味着卷积核只看当前位置自己，不跨越相邻位置。于是对每个位置 i：Conv1d:  y[:, :, i] = W(16×64) · x[:, :, i] + b
+        # # 等价写法（结果一模一样，只是写法不同）
+        # key = nn.Linear(64, 16)(entity_embeddings)   # [batch, 512, 16]
+        # 为什么必须"互不影响"？因为 512 个实体槽位是一个集合，不是序列——实体在槽位里的排列顺序是任意的（这一帧 Zealot 排第 3，下一帧可能排第 7）。如果卷积核 > 1，模型就会利用"相邻槽位"的信息，学到虚假的、依赖排序的规律。kernel=1 保证了置换不变性：无论实体怎么排序，每个实体得到的 key 只取决于它自己的嵌入。
         self.conv_1 = nn.Conv1d(in_channels=embedding_size, 
                                 out_channels=original_32, kernel_size=1, stride=1,
                                 padding=0, bias=True)
@@ -56,6 +70,15 @@ class SelectedUnitsHead(nn.Module):
         self.fc_1 = nn.Linear(autoregressive_embedding_size, original_256)
         self.fc_2 = nn.Linear(original_256, original_32)
 
+        '''
+        想象人类玩家框选单位：先点一个 Zealot，再点一个 Stalker，再点一个哨兵……第 2 个选择依赖第 1 个：
+
+        硬约束：同一个单位不能重复选（代码里用 mask 去重）；
+        软策略：选了 3 个 Zealot 后，第 4 个可能想选个哨兵（开护盾）而不是第 4 个 Zealot——这是"组合"层面的决策。
+        如果每一轮都从零开始、只看当前 embedding，模型就只能学"每个单位独立地看谁最合适"，学不到"组合搭配"。LSTM 的 hidden 状态就是为此服务的：它把"已经选了哪些单位"压缩成一个 16 维记忆，参与下一轮 query 的生成。
+
+        （补充：autoregressive_embedding 里其实也写回了上一轮选中的实体信息，但那是"显式"的、经 project 变换的全局信号；LSTM 的 hidden 是"隐式"的、专门为这个选择序列服务的记忆，两者互补。）
+        '''
         self.small_lstm = nn.LSTM(input_size=original_32, hidden_size=original_32, num_layers=1, 
                                   dropout=0.0, batch_first=True)
 
@@ -81,7 +104,7 @@ class SelectedUnitsHead(nn.Module):
         '''
         autoregressive_embedding: 游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size）
         action_type: 选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
-        entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示
+        entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示，这里应该是整个画面上展示的所有实体
         entity_num：每个样本的有效实体数量
         unit_type_entity_mask：主动根据选择的动作，从观察列表中判断执行动作能够影响到选择到的实体掩码
 
@@ -96,7 +119,7 @@ class SelectedUnitsHead(nn.Module):
             autoregressive_embedding: [batch_size x autoregressive_embedding_size]
         '''
         batch_size = entity_embeddings.shape[0]
-        entity_size = entity_embeddings.shape[-2]
+        entity_size = entity_embeddings.shape[-2] # 等于 lq/实体数量 512
         device = next(self.parameters()).device
         key_size = self.new_variable.shape[0]
         original_ae = autoregressive_embedding
@@ -126,9 +149,11 @@ class SelectedUnitsHead(nn.Module):
 
         # now the entity nums should be added 1 (including the EOF)
         # this is because we also want to compute the mean including key value of the EOF
-        added_entity_num = entity_num + 1
+        added_entity_num = entity_num + 1 # 这里是将EOF槽也算进去了，EOF代表选择对象结束的标识
 
         # mask: [batch_size, entity_size]
+        # mask 代表是当前画面所有可操作的对象，而added_entity_num代表有效可以操作的实体对象
+        # 所以这里是提前进行掩码，对每一个样本限制在有效对象内进行掩码
         mask = mask < added_entity_num.unsqueeze(dim=1)
         assert mask.dtype == torch.bool
 
@@ -137,6 +162,12 @@ class SelectedUnitsHead(nn.Module):
         # and creates a new variable corresponding to ending unit selection.
         # input: [batch_size x entity_size x embedding_size]
         # output: [batch_size x entity_size x key_size], note key_size = 32
+        # entity_embeddings：(b, lq/实体数量 512，dim)
+        # entity_embeddings.transpose(-1, -2)：（batch_size, dim, lq/实体数量）
+        # self.conv_1：把每个实体的 64 维嵌入，通过一个"逐实体独立"的线性变换，压缩成 16 维的 key 向量。 （batch_size, original_32, lq/实体数量）
+        # .transpose(-1, -2)：（batch_size, lq/实体的数量，original_32）
+        # 这里是进一步压碎每一个实体的嵌入表示
+        # key这里是进一步压缩的每一个实体的向量表示
         key = self.conv_1(entity_embeddings.transpose(-1, -2)).transpose(-1, -2)
 
         # end index should be the same to the entity_num
@@ -147,80 +178,121 @@ class SelectedUnitsHead(nn.Module):
         if False:
             key[torch.arange(batch_size), end_index] = self.new_variable
         else:
+            # padding_end shape (batch_size, 1， original_32) 全零矩阵
             padding_end = torch.zeros(key.shape[0], 1, key.shape[2], dtype=key.dtype, device=key.device)
+            # key shape （batch_size, lq/实体的数量，original_32），这里是将最后一个位置替换为填充0
             key = torch.cat([key[:, :-1, :], padding_end], dim=1)
 
+            # flag 全1矩阵 shape （batch_size, lq/实体的数量，original_32）
             flag = torch.ones(key.shape, dtype=torch.bool, device=key.device)
+            # 根据有效实体的数量，在对应位置设置False，表示到这里就结束了
             flag[torch.arange(batch_size), end_index] = False
 
             # [batch_size, entity_size, key_size]
+            # 这段代码在做一个**"可微的定点替换"：把每个样本 entity_num 位置（EOF 结束符槽位）的 key 向量，替换成可学习的参数 new_variable。之所以不用一行 key[..., end_index] = new_variable 直接赋值，是因为索引赋值是 in-place 操作，会破坏反向传播**；所以作者改用"布尔 flag + 乘法"的纯张量运算，效果相同但梯度畅通。
+            # torch.ones(key.shape, dtype=key.dtype, device=key.device)： shape （batch_size, lq/实体的数量，original_32）
+            # self.new_variable （1， original_32）
+            # end_embedding：（batch_size, lq/实体的数量，original_32），全是new_variable
             end_embedding = torch.ones(key.shape, dtype=key.dtype, device=key.device) * self.new_variable.reshape(1, -1)
+            # 通过~flag，key_end_part shape 虽然是（batch_size, lq/实体的数量，original_32），但是里面的值仅留着只留 EOF 槽位的值
             key_end_part = end_embedding * ~flag
 
             # use calculation to replace new_variable
-            key_main_part = key * flag
-            key = key_main_part + key_end_part
+            key_main_part = key * flag # 这里使用相乘，EOF结束为止就变成了0，其余为止保持不变
+            key = key_main_part + key_end_part # 这里将EOF为止的向量替换为new_variable可学习的张量
+            #  （batch_size, lq/实体的数量，original_32）
 
             del padding_end, flag, end_embedding, key_main_part, key_end_part
 
         # calculate the average of keys (consider the entity_num)
+        # mask [batch_size, entity_size]
+        # mask.unsqueeze(dim=2)：[batch_size, entity_size = lq/实体数量 512， 1]
+        # .repeat(1, 1, key.shape[-1])：[batch_size, entity_size， original_32]
         key_mask = mask.unsqueeze(dim=2).repeat(1, 1, key.shape[-1])
+        # key （batch_size, lq/实体的数量，original_32）
+        # key_mask [batch_size, entity_size = lq/实体数量 512， original_32]
+        # key * key_mask：这两个相成，进一步将有效对象和无效对象区分开 batch_size, lq/实体的数量，original_32）
+        # torch.sum：将所有实体对象的嵌入合起来：（batch_size, 1，original_32）
+        #  / entity_num.reshape(batch_size, 1)：将sum合起来的嵌入表示取平均值，shape （batch_size, 1，original_32）
+        # 这里就有点像rag中每个样本总体有效对象的嵌入表示
         key_avg = torch.sum(key * key_mask, dim=1) / entity_num.reshape(batch_size, 1)
         del key_mask
 
         # creates a new variable corresponding to ending unit selection.
         # QUESTION: how to do that?
         # ANSWER: referred by the DI-star project, please see self.new_variable in init() method
-        units_logits = []
-        units = []
-        hidden = None
-
+        # todo 以下几个对象的作用
+        units_logits = [] # 存储每一次选择对象预测时的logits分布
+        units = [] # 存储每一次选择对象的实体索引
+        hidden = None # LSTM的隐藏状态，
+ 
         # referneced by DI-star
         # represented which sample in the batch has end the selection
         # note is_end should be bool type to make sure it is a right whether mask 
+        # todo 看起来是构建一个结束为止的张量，shape （batch_size,），初始全false
+        # 确认选择对象
         is_end = torch.zeros(batch_size, device=device).bool()
 
         # in the first selection, we should not select the end_index
+        # mask [batch_size, entity_size = lq/实体数量 512]
+        # 这里是将EOF为止的mask设置为False todo为啥？
         mask[torch.arange(batch_size), end_index] = False
 
         # if we stop selection early, we should record in each sample we select how many items
+        # torch.ones(batch_size, dtype=torch.long, device=device)： shape （batch_size，） 全1矩阵
+        # * self.max_selected：构建一个能够选择最大实体数量的矩阵
+        # 主要用来记录已经选择的实体数量
         select_units_num = torch.ones(batch_size, dtype=torch.long, device=device) * self.max_selected
 
         # AlphaStar: repeated for selecting up to 64 units
         for i in range(self.max_selected):
             if i == 1:
+                # todo 这里为啥有设置会True
                 mask[torch.arange(batch_size), end_index] = True  # in the second selection, we can select the EOF
                 if self.is_rl_training and unit_type_entity_mask is not None:
                     unit_type_entity_mask[torch.arange(batch_size), end_index] = True
 
-            x = self.fc_1(autoregressive_embedding)
-            x = self.fc_2(F.relu(x + the_func_embed)).unsqueeze(dim=1)
+            # 进一步将`聚合到一个执行动作->可选择对象类型的特征嵌入`加入到autoregressive_embedding中
+            x = self.fc_1(autoregressive_embedding) # （batch， original_256）
+            x = self.fc_2(F.relu(x + the_func_embed)).unsqueeze(dim=1) # （batch， 1， original_32）
 
+            # 这行代码是"选单位循环的记忆核心"：一个小 LSTM 每轮接收当前解码状态 x，输出一个 query（用于给 512 个实体打分），同时把内部状态 hidden 传到下一轮——这样第 2 次选单位时，模型"记得"第 1 次选了谁，多单位选择就变成了有先后依赖的序列决策。
             query, hidden = self.small_lstm(x, hidden)
+            # key：（batch_size, lq/实体的数量，original_32）
+            # query：（batch， 1， original_32）
+            # query * key： （batch_size, lq/实体的数量，original_32）
+            # torch.sum：（batch_size, lq/实体的数量）结合当前局势状态、历史状态得到权重系数，乘以每一个实体求和得到实体的分数
+            # query 形状 [batch, 1, 16]，key 形状 [batch, 512, 16]，广播相乘后对最后一维求和——每个实体槽位得到一个点积分数。这就是 Pointer Network 的注意力打分：
+            # query = "我现在想找什么样的单位"（由当前局势 + 已选历史决定）
+            # key   = "每个单位是什么"（由实体嵌入 conv 而来）
+            # y     = 两者匹配度
             y = torch.sum(query * key, dim=-1)
 
+            # 将非实体的对象全部mask
             entity_logits = y.masked_fill(~mask, -1e9)
             if self.is_rl_training and self.use_unit_type_entity_mask and unit_type_entity_mask is not None:
+                # 这里是外部主动传入可以操作的对象掩码
                 entity_logits = entity_logits.masked_fill(~unit_type_entity_mask, -1e9)
 
             temperature = self.temperature if self.is_rl_training else 1
             entity_logits = entity_logits / temperature
             del x, y, query
 
-            entity_probs = self.softmax(entity_logits)
-            entity_id = torch.multinomial(entity_probs, 1)
+            entity_probs = self.softmax(entity_logits) # 为每一个对象打分 （batch_size, lq/实体的数量）
+            entity_id = torch.multinomial(entity_probs, 1) # 为每一个样本进行抽样，选择一个实体对象（batch_size, 1）
 
-            units_logits.append(entity_logits.unsqueeze(-2))
-            units.append(entity_id.unsqueeze(-2))
+            units_logits.append(entity_logits.unsqueeze(-2)) # （batch_size, 1, lq/实体的数量）
+            units.append(entity_id.unsqueeze(-2)) # （batch_size, 1，1）
 
+            # 已经选择的对象不再进行选择，对应位置的mask设置为False
             mask[torch.arange(batch_size), entity_id.squeeze(dim=1)] = False  # masked out so that it cannot be selected in future iterations.
 
-            last_index = (entity_id.squeeze(dim=1) == end_index)
-            is_end[last_index] = 1
+            last_index = (entity_id.squeeze(dim=1) == end_index) # 这里代表预测到的结束位置
+            is_end[last_index] = 1 # 对应样本是否结束选择的标识设置为1
 
             # we record how many items we select in a sample
             # we select i + 1 items, but this include the EOF, so actually items should be i + 1 - 1
-            select_units_num[last_index] = i
+            select_units_num[last_index] = i # 更新对应样本已经选择的实体数量
 
             # AlphaStar: The one-hot position of the selected entity is multiplied by the keys, 
             # reduced by the mean across the entities, passed through a linear layer of size 1024, 
