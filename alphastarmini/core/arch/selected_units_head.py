@@ -199,7 +199,7 @@ class SelectedUnitsHead(nn.Module):
 
             # use calculation to replace new_variable
             key_main_part = key * flag # 这里使用相乘，EOF结束为止就变成了0，其余为止保持不变
-            key = key_main_part + key_end_part # 这里将EOF为止的向量替换为new_variable可学习的张量
+            key = key_main_part + key_end_part # 这里将EOF位置的向量替换为new_variable可学习的张量
             #  （batch_size, lq/实体的数量，original_32）
 
             del padding_end, flag, end_embedding, key_main_part, key_end_part
@@ -211,7 +211,7 @@ class SelectedUnitsHead(nn.Module):
         key_mask = mask.unsqueeze(dim=2).repeat(1, 1, key.shape[-1])
         # key （batch_size, lq/实体的数量，original_32）
         # key_mask [batch_size, entity_size = lq/实体数量 512， original_32]
-        # key * key_mask：这两个相成，进一步将有效对象和无效对象区分开 batch_size, lq/实体的数量，original_32）
+        # key * key_mask：这两个相乘，进一步将有效对象和无效对象区分开 batch_size, lq/实体的数量，original_32）
         # torch.sum：将所有实体对象的嵌入合起来：（batch_size, 1，original_32）
         #  / entity_num.reshape(batch_size, 1)：将sum合起来的嵌入表示取平均值，shape （batch_size, 1，original_32）
         # 这里就有点像rag中每个样本总体有效对象的嵌入表示
@@ -245,6 +245,7 @@ class SelectedUnitsHead(nn.Module):
         select_units_num = torch.ones(batch_size, dtype=torch.long, device=device) * self.max_selected
 
         # AlphaStar: repeated for selecting up to 64 units
+        # 提前结束的处理核心是三个机制：① 用 is_end 布尔标记记录"哪些样本已选中 EOF"；② 用 ~is_end 掩码阻止已结束样本把选中单位写回 autoregressive_embedding；③ 用 select_units_num[last_index] = i 只给结束样本记录实际选中数。而 units_logits / units 是无条件 append 的（没有专门阻止），靠 select_units_num 在后续阶段截断。
         for i in range(self.max_selected):
             if i == 1:
                 # todo 这里为啥有设置会True
@@ -281,18 +282,21 @@ class SelectedUnitsHead(nn.Module):
             entity_probs = self.softmax(entity_logits) # 为每一个对象打分 （batch_size, lq/实体的数量）
             entity_id = torch.multinomial(entity_probs, 1) # 为每一个样本进行抽样，选择一个实体对象（batch_size, 1）
 
+            # 这两行没有用 is_end 做任何屏蔽——已结束样本在后续轮次的采样结果照样被 append 进去。
+            # 靠 select_units_num 在后续阶段截断
             units_logits.append(entity_logits.unsqueeze(-2)) # （batch_size, 1, lq/实体的数量）
             units.append(entity_id.unsqueeze(-2)) # （batch_size, 1，1）
 
             # 已经选择的对象不再进行选择，对应位置的mask设置为False
+            # 而 is_end[last_index] = 1 之所以不会被后续预测影响，靠的是一条完整的因果链：EOF 槽位被 mask 屏蔽 → logits 被填成 -1e9 → softmax 后概率恰好为 0 → multinomial 永远采不到它 → 后续轮次 last_index 恒为 False → 不再触发任何写入。此外 is_end 本身是"只置 1、永不置 0"的单向棘轮，天然防覆盖。
             mask[torch.arange(batch_size), entity_id.squeeze(dim=1)] = False  # masked out so that it cannot be selected in future iterations.
 
             last_index = (entity_id.squeeze(dim=1) == end_index) # 这里代表预测到的结束位置
-            is_end[last_index] = 1 # 对应样本是否结束选择的标识设置为1
+            is_end[last_index] = 1 # 对应样本是否结束选择的标识设置为1，只有检测到结束选择是才会设置为1，如果没有结束，由于last_index时false则不会设置为1
 
             # we record how many items we select in a sample
             # we select i + 1 items, but this include the EOF, so actually items should be i + 1 - 1
-            select_units_num[last_index] = i # 更新对应样本已经选择的实体数量
+            select_units_num[last_index] = i # 更新对应样本已经选择的实体数量，这里也如上所说，只会更新选为end的样本
 
             # AlphaStar: The one-hot position of the selected entity is multiplied by the keys, 
             # reduced by the mean across the entities, passed through a linear layer of size 1024, 
@@ -300,30 +304,52 @@ class SelectedUnitsHead(nn.Module):
             entity_one_hot = L.tensor_one_hot(entity_id, entity_size).squeeze(-2)
             entity_one_hot_unsqueeze = entity_one_hot.unsqueeze(-2) 
 
-            out = torch.bmm(entity_one_hot_unsqueeze, key).squeeze(-2)
-            out = out - key_avg
-            t = self.project(out)
+            # 从 512 个实体的 key 矩阵里，精确"取出"本轮采样选中的那一个实体的 16 维 key 向量。实现方式是用一个 one-hot 向量做矩阵乘
+            # key shape is （batch_size, lq/实体的数量，original_32）
+            # entity_one_hot_unsqueeze shape is （batch_size, 1, lq/实体的数量)
+            # torch.bmm(entity_one_hot_unsqueeze, key) shape is （batch_size, 1，original_32）
+            # out shape is （batch_size，original_32）
+            # 上一轮循环里，模型已经采样出 entity_id（[batch, 1]，本轮选中的实体下标）。现在要把"选中了谁"这个信息写回 autoregressive_embedding，让下一轮选择"知道"这一轮的结果。写回的第一步，就是拿到这个被选中实体的 key 向量。
+            # 注意one-hot就是在某个位置为1，其余位置为0，所以可以用来查表提取数据
+            # one-hot 向量乘矩阵，结果就是"第 j 行"——这就是线性代数里的"行选择"。用大白话说：one-hot 里唯一那个 1 的位置，决定了从 512 行里挑出哪一行。
+            '''
+            为什么用 one-hot 矩阵乘，而不是直接索引？
+            你可能会问：key[torch.arange(batch), entity_id.squeeze(1)] 一行不就拿到了吗？确实可以，但这里用 one-hot 有两个理由：
+
+            忠实于 AlphaStar 论文原文：论文写的就是 "The one-hot position of the selected entity is multiplied by the keys"，代码逐字复刻（代码注释第 220 行也引用了这句）。
+            形式统一、便于扩展：one-hot 乘矩阵是"软选择"的通用形式。如果将来把 one-hot 换成概率分布（软注意力），bmm 写法不用改，直接换成分布向量即可；索引写法则完全行不通。
+
+            注意一个细节：entity_id 是 multinomial 采样出来的离散值，tensor_one_hot 是用索引构造的（eye()[labels]），所以梯度不会穿过 entity_id——这正是期望的（离散选择不可导，policy gradient 会从别处处理）。这里 one-hot 纯粹是"选择器"，不是可微变量。
+            '''
+            out = torch.bmm(entity_one_hot_unsqueeze, key).squeeze(-2) # 拿到我选择到的实体压缩嵌入向量
+            out = out - key_avg # 剪掉全场实体压缩嵌入的均值，减去它，写回的信息就变成"这个实体相对全场平均水平有多特别"——中心化后信号更干净，避免绝对尺度的漂移。
+            t = self.project(out) # 还原为实体嵌入的维度
+            # ~is_end：如果本轮选的是 EOF（结束符），不写回（EOF 没有实体信息，写回会污染后续）。在批量处理中也是将某些提前结束的样本数据避免持续加入到autoregressive_embedding污染
+            # 否则就将选择的实体信息加入到全局的信息中
             autoregressive_embedding = autoregressive_embedding + t * ~is_end.unsqueeze(dim=1)
 
-            if P.skip_autoregressive_embedding:
+            if P.skip_autoregressive_embedding: # 超参数，如果不考虑全局的信息
                 autoregressive_embedding = autoregressive_embedding - autoregressive_embedding
                 autoregressive_embedding[:] = 0.
 
             del temperature, entity_logits, entity_probs, entity_id
             del last_index, entity_one_hot, entity_one_hot_unsqueeze, out, t
 
-            if is_end.all():
+            # 这种"部分样本提前结束、整批继续跑"的设计，是为了保持 batch 内循环次数一致，方便张量并行——代价是已结束样本多做几轮无用的采样计算。
+            if is_end.all():# 如果所有的样本都结束选择了就直接结束循环不再选择
                 break
+        # 通过以上循环选择，将需要选择的单位信息都加入到了 autoregressive_embedding中年
 
         # units_logits: [batch_size x select_units x entity_size]
-        units_logits = torch.cat(units_logits, dim=1)
+        units_logits = torch.cat(units_logits, dim=1) # 将每次预测的选择logit分布组合起来
 
         # units: [batch_size x select_units x 1]
-        units = torch.cat(units, dim=1)
+        units = torch.cat(units, dim=1) # 将每次预测选择的实体id组合起来
 
         # we use zero padding to make units_logits has the size of [batch_size x max_selected x entity_size]
         # TODO: change the padding
-        padding_size = self.max_selected - units_logits.shape[1]
+        padding_size = self.max_selected - units_logits.shape[1] # 这里是如果所有的样本都提前结束选择，则构建一个padding矩阵，将
+        # units_logits和 units的第二个维度凑齐 max_selected的长度
         if padding_size > 0:
             pad_units_logits = torch.ones(units_logits.shape[0], padding_size, units_logits.shape[2],
                                           dtype=units_logits.dtype, device=units_logits.device) * (-1e9)
@@ -339,22 +365,33 @@ class SelectedUnitsHead(nn.Module):
 
         # select_unit_mask: [batch_size x 1]
         # note select_unit_mask should be bool type to make sure it is a right whether mask 
+        # 根据执行的动作选择该动作是否能够选择单位的掩码矩阵
         select_unit_mask = L.action_involve_selecting_units_mask(action_type).bool()
 
+        # 取反获取无法支持选择单位的动作矩阵
         no_select_units_index = ~select_unit_mask.squeeze(dim=1)
         print("no_select_units_index:", no_select_units_index) if debug else None
 
-        select_units_num[no_select_units_index] = 0
+        # 对于无法支持选择动作的样本，将其选择的相关信息置为0或者空
+        select_units_num[no_select_units_index] = 0 # 选择0个单位
         #autoregressive_embedding[no_select_units_index] = original_ae[no_select_units_index]
 
-        units_logits[no_select_units_index] = -1e9  # a magic number
-        units[no_select_units_index, :, 0] = entity_size - 1  # None index, the same as -1
+        units_logits[no_select_units_index] = -1e9  # a magic number 实体分布预测全部只为极小值
+        units[no_select_units_index, :, 0] = entity_size - 1  # None index, the same as -1 。entity_size - 1（= 512 − 1 = 511）是一个**“None / 空槽位”的占位标记**
+        # 最后一个槽位。正常对局单位数远小于 512，这个槽位几乎总是 padding 槽；且它仍是非负、在合法范围内的整数，后续任何代码拿到它都不会崩
+        # 更多看md文档
 
         print("select_units_num:", select_units_num) if debug else None
         print("autoregressive_embedding:", autoregressive_embedding) if debug else None
 
         del select_unit_mask, no_select_units_index, mask, is_end, key, key_avg
 
+        '''
+        units_logits shape is [batch_size x max_selected x entity_size] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测的实体logit分布
+        units：[batch_size x select_units x 1] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测采样的实体id
+        autoregressive_embedding：游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size），新加入了根据动作选择了要操作的实体单位的信息 todo 但是有些动作无法选择单位，这样混进去会不会有问题？可能会根据units_logits、units、select_units_num来影响拉回吧
+        select_units_num：【batch_size, 1]，存储每个样本选择了多少实体
+        '''
         return units_logits, units, autoregressive_embedding, select_units_num
 
     def mimic_forward(self, autoregressive_embedding, action_type, entity_embeddings, entity_num, units, select_units_num,

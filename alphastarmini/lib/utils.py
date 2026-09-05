@@ -505,6 +505,9 @@ def action_can_be_queued_mask(action_types):
 def action_involve_selecting_units(action_type):
     """
     test the action_type whether involve selecting units
+    测试 action_type 是否涉及选择单位
+    根据传入的动作类型索引，从RAW_FUNCTIONS表中提取该动作类型的是否是选择
+    单位的动作
 
     Inputs: action_type
     Outputs: true or false
@@ -522,18 +525,20 @@ def action_involve_selecting_units(action_type):
 def action_involve_selecting_units_mask(action_types):
     """
     test the action_type whether involve selecting units
+    测试 action_type 是否涉及选择单位
 
     Inputs: batch action_types
     Outputs: mask
     """
 
-    mask = torch.zeros_like(action_types).bool()
+    mask = torch.zeros_like(action_types).bool() # 构建一个和选择执行动作一样shape的mask，看来又要做动作类型的掩码了
     action_types = action_types.cpu().detach().numpy()
 
-    for i, action_type in enumerate(action_types):
+    for i, action_type in enumerate(action_types): # 遍历每一个动作
         action_type_index = action_type.item()
         print('i:', i, 'action_type_index:', action_type_index) if debug else None
 
+        # 返回true表示该动作是支持选择单位的，返回false表示该动作不支持选择单位
         mask[i] = action_involve_selecting_units(action_type_index)
         del action_type_index, action_type
 
