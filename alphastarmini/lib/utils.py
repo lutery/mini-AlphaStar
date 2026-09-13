@@ -112,7 +112,7 @@ for i in range(ConstSize.Actions_Size): # 遍历所有可能的动作
         reorder_type_list = [unit_tpye_to_unit_type_index(j) for j in type_set]
         print('reorder_type_list', reorder_type_list) if debug else None
 
-        TARGET_UNITS_TYPES_MASK[i, reorder_type_list] = 1
+        TARGET_UNITS_TYPES_MASK[i, reorder_type_list] = 1 # 根据对象类型转换为对象索引后，将对应位置的设置为1，代表当前动作，指定的类型是可以被选择使用的
 
         del type_set, reorder_type_list
 
@@ -550,6 +550,7 @@ def action_involve_selecting_units_mask(action_types):
 def action_involve_targeting_unit(action_type):
     """
     test the action_type whether involve targeting units
+    target_unit_tag 表示对应动作是否需要选择一个目标单位的标识
 
     Inputs: action_type
     Outputs: true or false
@@ -566,12 +567,14 @@ def action_involve_targeting_unit(action_type):
 def action_involve_targeting_unit_mask(action_types):
     """
     test the action_type whether involve targeting units
+    根据动作类型，确认该动作是否需要指定一个目标单位
+    返回一个 [batch, 1] 的布尔掩码——回答的问题是"这个动作需不需要指定一个目标单位"。需要 → True；不需要（no_op、移动镜头、造建筑等）→ False，此时 TargetUnitHead 的输出会被整体置空。
 
     Inputs: batch action_types
     Outputs: mask
     """
 
-    mask = torch.zeros_like(action_types).bool()
+    mask = torch.zeros_like(action_types).bool() # [batch, 1] 
     action_types = action_types.cpu().detach().numpy()
 
     for i, action_type in enumerate(action_types):
@@ -689,6 +692,8 @@ def action_can_apply_to_selected_mask(action_types):
 def action_can_apply_to_targeted_mask(action_types):
     """
     find the entity_types which the action_type can be applied to
+    选择当前动作可以作用于哪些兵种
+    它被 TargetUnitHead 用来注入"该找什么类型的目标"的先验。
 
     # Updated in mAS 1.06
     # By the action_dict from the DI-Star project, we can implement

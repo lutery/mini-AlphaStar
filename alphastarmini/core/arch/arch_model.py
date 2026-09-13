@@ -150,7 +150,7 @@ class ArchModel(nn.Module):
         '''
         entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示
         embedded_entity：[batch_size, fc1_output_size]，包含每个样本的总体嵌入表示
-        entity_num：每个样本的有效实体数量
+        entity_nums：每个样本的有效实体数量
         unit_types_one：(batch_size, max_entities)，每个样本每个位置的实体类型（比如机枪兵、碉堡亦或者只是个padding）
         '''
         entity_embeddings, embedded_entity, entity_nums = self.entity_encoder(state.entity_state)   
@@ -251,6 +251,12 @@ class ArchModel(nn.Module):
 
         del embedded_entity, embedded_spatial, embedded_scalar, scalar_context, available_actions
 
+        '''
+        units_logits shape is [batch_size x max_selected x entity_size] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测的实体logit分布
+        units：[batch_size x select_units x 1] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测采样的实体id
+        autoregressive_embedding：游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size），新加入了根据动作选择了要操作的实体单位的信息 
+        select_units_num：【batch_size, 1]，存储每个样本选择了多少实体
+        '''
         units_logits, units, autoregressive_embedding, select_units_num = self.selected_units_head(autoregressive_embedding, 
                                                                                                    action_type, 
                                                                                                    entity_embeddings, 
@@ -273,6 +279,10 @@ class ArchModel(nn.Module):
         print('autoregressive_embedding:', autoregressive_embedding) if debug else None
         print('autoregressive_embedding.shape:', autoregressive_embedding.shape) if debug else None       
 
+        '''
+        target_unit_logits: 每一个样本根据动作生成的选择实体目标的logits分布（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为0 [batch_size x 1 x entity_size]
+        target_unit：根据动作选择的目标实体索引（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为entity_size - 1 [batch_size x 1 x 1]
+        '''
         target_unit_logits, target_unit = self.target_unit_head(autoregressive_embedding, 
                                                                 action_type, entity_embeddings, entity_nums)
         target_location_logits, target_location = self.location_head(autoregressive_embedding, action_type, map_skip)

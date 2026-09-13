@@ -109,7 +109,16 @@ class Agent(object):
     def preprocess_state_entity_numpy(obs, return_entity_pos=False):
         t = time()
 
-        raw_units = obs["raw_units"]
+        '''
+        pysc2 观测的 raw_units——这是当前这一帧观测里所有可见的单位，包括：
+
+        己方单位（Probe、Zealot、建筑……）
+        敌方单位（可见的敌人——所以"能选择的实体"这个说法不对，敌方单位通常不能选，但可以作为攻击目标）
+        中立单位（矿、气、水晶等资源点）
+
+        战争迷雾中的不可见单位不在 raw_units 里，所以不是"整个地图所有实体"。
+        '''
+        raw_units = obs["raw_units"] 
         entities_array, entity_pos = ArchModel.preprocess_entity_numpy(raw_units, return_entity_pos=return_entity_pos)
         batch_entities_array = np.expand_dims(entities_array, axis=0) 
 

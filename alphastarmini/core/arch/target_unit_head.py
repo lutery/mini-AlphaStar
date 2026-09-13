@@ -63,6 +63,10 @@ class TargetUnitHead(nn.Module):
             action_type: [batch_size x 1]
             entity_embeddings: [batch_size x entity_size x embedding_size]
             entity_num: [batch_size]
+            autoregressive_embedding：游戏资源、地图信息等选择预测的动作+局势的嵌入+操作延迟（下一次什么时候在预测动作操作）+ 针对执行动作指令action_type是否需要立即执行的掩码信息 （batch， autoregressive_embedding_size），新加入了根据动作选择了要操作的实体单位的信息 
+            action_type:选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
+            entity_embeddings: (b, lq/实体数量 512，dim)，包含每个实体的嵌入表示，这个注释一个固定的实体槽位，即实体的嵌入放到这个槽位内，具体有多少个实体由entity_nums决定
+            entity_nums:每个样本的有效实体数量
         Output:
             target_unit_logits: [batch_size x max_selected x entity_size]
             target_unit: [batch_size x max_selected x 1]
@@ -75,13 +79,14 @@ class TargetUnitHead(nn.Module):
 
         # `func_embed` is computed the same as in the Selected Units head, 
         # and used in the same way for the query (added to the output of the `autoregressive_embedding` 
-        # passed through a linear of size 256).
+        # passed through a linear of size 256). 获取当前动作能作用的兵种
         unit_types_one_hot = L.action_can_apply_to_targeted_mask(action_type)
 
         device = next(self.parameters()).device
         unit_types_one_hot = unit_types_one_hot.to(device)
 
         # unit_types_mask shape: [batch_size x self.max_number_of_unit_types]
+        # 将当前能够作用的兵种信息进行压缩维度，得到 [batch_size x 256]
         the_func_embed = F.relu(self.func_embed(unit_types_one_hot))
 
         # the_func_embed shape: [batch_size x 256]
@@ -89,11 +94,11 @@ class TargetUnitHead(nn.Module):
         print("the_func_embed.shape:", the_func_embed.shape) if debug else None
 
         # generate the length mask for all entities
-        mask = torch.arange(entity_size, device=device).float()
-        mask = mask.repeat(batch_size, 1)
+        mask = torch.arange(entity_size, device=device).float() # shape （entity_size，）
+        mask = mask.repeat(batch_size, 1) # shape is (batch_size, entity_size)
 
         # mask: [batch_size, entity_size]
-        mask = mask < entity_num.unsqueeze(dim=1)
+        mask = mask < entity_num.unsqueeze(dim=1) # 将 mask 转换为bool掩码矩阵，这样就可以得到一个每个样本哪些是有效实体，哪些是无效实体的矩阵
         print("mask:", mask) if debug else None
         print("mask.shape:", mask.shape) if debug else None
 
@@ -105,7 +110,8 @@ class TargetUnitHead(nn.Module):
         # and the query is applied to the keys which are created the 
         # same way as in the Selected Units head to get `target_unit_logits`.
         # input : [batch_size x entity_size x embedding_size]
-        key = self.conv_1(entity_embeddings.transpose(-1, -2)).transpose(-1, -2)
+        # 同样压缩每个输入实体的维度
+        key = self.conv_1(entity_embeddings.transpose(-1, -2)).transpose(-1, -2) #  [batch_size x entity_size x key_size], note key_size = 32
 
         # output : [batch_size x entity_size x key_size], note key_size = 32
         print("key:", key) if debug else None
@@ -114,20 +120,21 @@ class TargetUnitHead(nn.Module):
         # AlphaStar: The query is then passed through a ReLU and a linear of size 32, 
         # and the query is applied to the keys which are created the same way as in 
         # the Selected Units head to get `target_unit_logits`.
-        x = self.fc_1(autoregressive_embedding)
-        x = the_func_embed + x
-        query = self.fc_2(x).unsqueeze(1)
+        x = self.fc_1(autoregressive_embedding) # 提取全局信息的矩阵
+        x = the_func_embed + x # 将当前动作能勾作用的兵种信息嵌入到 autoregressive_embedding 中 [batch_size x 256]
+        query = self.fc_2(x).unsqueeze(1) # [batch_size， 1， 32]
 
         # below is matrix multiply
         # key_shape: [batch_size x entity_size x key_size], note key_size = 32
         # query_shape: [batch_size x seq_len x hidden_size], note hidden_size is also 32, seq_len = 1
+        # 这里应该是类似qkv的查询，用实体去对比全局信息，确认当前局势下应该对哪些实体加强关注，哪些实体减少关注
         y = torch.bmm(key, query.transpose(-1, -2))
 
         # new y shape: [batch_size x entity_size]
         y = y.squeeze(-1)
 
         # fill the entity which should be selected a very large negetive value 
-        target_unit_logits = y.masked_fill(~mask, -1e9)
+        target_unit_logits = y.masked_fill(~mask, -1e9) # 用掩码将非实体部分掩盖，target_unit_logits [batch_size x entity_size]
 
         temperature = self.temperature if self.is_rl_training else 1
         target_unit_logits = target_unit_logits / temperature
@@ -135,30 +142,34 @@ class TargetUnitHead(nn.Module):
         print("target_unit_logits.shape:", target_unit_logits.shape) if debug else None
 
         # AlphaStar: If `action_type` does not involve targetting units, this head is ignored.
-        target_unit_mask = L.action_involve_targeting_unit_mask(action_type).bool()
+        target_unit_mask = L.action_involve_targeting_unit_mask(action_type).bool() # [batch, 1] ，返回是否需要选择一个目标的bool矩阵
         assert len(action_type.shape) == 2  
         assert target_unit_mask.dtype == torch.bool  
-        no_target_unit_mask = ~target_unit_mask.squeeze(dim=1)
+        no_target_unit_mask = ~target_unit_mask.squeeze(dim=1) # 取反，得到一个不需要选择目标的bool矩阵 [batch, 1] 
 
-        if target_unit is None:
-            target_unit_probs = self.softmax(target_unit_logits)
-            target_unit = torch.multinomial(target_unit_probs, 1)
+        if target_unit is None: # 如果没有专家数据指定要选择的目标，则直接根据qk的出来的注意力矩阵选择目标
+            target_unit_probs = self.softmax(target_unit_logits) # [batch_size x entity_size]
+            target_unit = torch.multinomial(target_unit_probs, 1) # [batch_size x 1]
             del target_unit_probs
 
-            target_unit = target_unit.unsqueeze(dim=1)
+            target_unit = target_unit.unsqueeze(dim=1) # [batch_size x 1 x 1]
             print("target_unit.shape:", target_unit.shape) if debug else None
 
-            target_unit[no_target_unit_mask, 0] = entity_size - 1  # None index, the same as -1
+            target_unit[no_target_unit_mask, 0] = entity_size - 1  # None index, the same as -1 将不需要选择目标的动作类型对应的样本置为一个占位符
             print("target_unit:", target_unit) if debug else None
 
-        target_unit_logits = target_unit_logits.unsqueeze(dim=1)
+        target_unit_logits = target_unit_logits.unsqueeze(dim=1) # [batch_size x 1 x entity_size]
         print("target_unit_logits.shape:", target_unit_logits.shape) if debug else None
 
-        target_unit_logits[no_target_unit_mask] = 0.  # a magic number
+        target_unit_logits[no_target_unit_mask] = 0.  # a magic number 同样将不需要选择目标的所有logits分布设置为0
 
         del x, y, mask, key, query, action_type
         del unit_types_one_hot, the_func_embed, no_target_unit_mask
 
+        '''
+        target_unit_logits: 每一个样本根据动作生成的选择实体目标的logits分布（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为0 [batch_size x 1 x entity_size]
+        target_unit：根据动作选择的目标实体索引（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为entity_size - 1 [batch_size x 1 x 1]
+        '''
         return target_unit_logits, target_unit
 
 

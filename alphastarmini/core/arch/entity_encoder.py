@@ -104,13 +104,18 @@ class EntityEncoder(nn.Module):
 
     @classmethod
     def preprocess_numpy(cls, entity_list, return_entity_pos=False, debug=False):
+        '''
+        entity_list: 从pysc2中获取的实体列表
+        return_entity_pos：待定
+        '''
         entity_array_list, entity_pos_list = [], []
 
         t = time()
-        for i, entity in enumerate(entity_list):
-            if i >= cls.max_entities:
+        for i, entity in enumerate(entity_list): # 遍历实体列表
+            if i >= cls.max_entities: # 最大实体数量，这里估计就是 entity_embeddings的第二个维度值
                 break
 
+            # todo 后续继续
             field_encoding_list = []
 
             unit_type_index = L.unit_tpye_to_unit_type_index(entity.unit_type)  # change to a fast version
@@ -422,11 +427,12 @@ class EntityEncoder(nn.Module):
         real_entities_size = all_entities_array.shape[0]
 
         # we use a bias of 0 for any of the 512 entries that doesn't refer to an entity.
+        # 如果获取的实体数量不足 max_entities
         if all_entities_array.shape[0] < cls.max_entities:
-            bias_length = cls.max_entities - all_entities_array.shape[0]
-            bias = np.zeros((bias_length, AHP.embedding_size))
-            bias[:, :] = cls.bias_value
-            all_entities_array = np.concatenate([all_entities_array, bias], axis=0)
+            bias_length = cls.max_entities - all_entities_array.shape[0] # 获取需要填充的大小
+            bias = np.zeros((bias_length, AHP.embedding_size)) # 构建填充矩阵
+            bias[:, :] = cls.bias_value # 填充上默认值
+            all_entities_array = np.concatenate([all_entities_array, bias], axis=0) # 将填充值cat到实体矩阵中
             del bias
 
         all_entities_array = all_entities_array.astype(np.float32)
