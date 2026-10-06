@@ -285,6 +285,11 @@ class ArchModel(nn.Module):
         '''
         target_unit_logits, target_unit = self.target_unit_head(autoregressive_embedding, 
                                                                 action_type, entity_embeddings, entity_nums)
+        '''
+        这里根据地图信息以及选择的物体信息，动作类型对目标点击位置进行决策
+        target_location_logits: (B, 64(map_size), 64(map_size)), 地图每个像素的分数（用于 loss / RL 采样）
+        target_location: [B, 2] 采样出的坐标 [x, y]
+        '''
         target_location_logits, target_location = self.location_head(autoregressive_embedding, action_type, map_skip)
 
         action_logits = ArgsActionLogits(action_type=action_type_logits, delay=delay_logits, queue=queue_logits,
