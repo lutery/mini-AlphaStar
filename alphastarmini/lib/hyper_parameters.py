@@ -334,7 +334,7 @@ AlphaStar_Agent_Interface_Format_Params = AgentInterfaceFormatParams(feature_dim
 StarCraftHyperParameters = namedtuple('StarCraftHyperParameters', ['screen_size', 
                                                                    'world_size',
                                                                    'max_unit_type', 
-                                                                   'count_beginning_build_order',
+                                                                   'count_beginning_build_order', # 开局建造顺序
                                                                    'sc2_default_delay',
                                                                    'max_order_ids',
                                                                    'max_buffer_ids',

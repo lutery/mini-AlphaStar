@@ -91,7 +91,7 @@ class Baseline(nn.Module):
         units_buildings: 累计造过哪些单位/建筑（布尔） （batch， 1）
         effects: 累计触发过哪些效果（布尔） （batch, 1)
         upgrade: 累计升级统计（布尔） (batch, 320)
-        beginning_build_order: 开局前 20 个建造顺序 (batch, 20, 建筑的嵌入维度）
+        beginning_build_order: 开局前 20 个建造顺序 (batch, 20, 建筑的one-hot编码）
         cumulative_score: 游戏累计积分 这些是游戏内部追踪的积分指标，只给 baseline 用、推理时不可见、人类玩家游戏中也看不到——包括总分、闲置生产/工作时间、单位与建筑总价值、摧毁总价值、采集矿/气总量与速率、支出总量等 13 项。相当于“考官专用的成绩单”：训练时 Critic 可以看它来判断局势好坏，但策略网不能看（避免依赖打分作弊）。相当于全图信息
         '''
         [agent_statistics, upgrades, unit_counts_bow,
@@ -103,19 +103,22 @@ class Baseline(nn.Module):
         # a linear with 1 hidden unit.
 
         device = next(self.parameters()).device
-        embedded_scalar_list = []
+        embedded_scalar_list = [] # 将每一个游戏状态的嵌入向量保存到该列表中
 
         # agent_statistics: Embedded by taking log(agent_statistics + 1) and passing through a linear of size 64 and a ReLU
-        the_log_statistics = torch.log(agent_statistics + 1)
-        x = F.relu(self.statistics_fc(the_log_statistics))
+        # +1 是保证数值不为0 torch.log 是将数值压缩
+        the_log_statistics = torch.log(agent_statistics + 1) 
+        x = F.relu(self.statistics_fc(the_log_statistics)) # x shape is （batch, original_64)
         del agent_statistics, the_log_statistics
         embedded_scalar_list.append(x)
 
+        # 同上
         score_log_statistics = torch.log(cumulative_score + 1)
         x = F.relu(self.cumulatscore_fc(score_log_statistics))
         del cumulative_score, score_log_statistics
         embedded_scalar_list.append(x)
 
+        # 同上，唯一不同的是由于数量级本身就足够小，所以不需要进行log压缩数量级
         # upgrades: The boolean vector of whether an upgrade is present is embedded through a linear of size 128 and a ReLU
         x = F.relu(self.upgrades_fc(upgrades))
         del upgrades
@@ -123,6 +126,7 @@ class Baseline(nn.Module):
 
         # unit_counts_bow: A bag-of-words unit count from `entity_list`. 
         # The unit count vector is embedded by square rooting, passing through a linear layer, and passing through a ReLU
+        # 同上
         x = F.relu(self.unit_counts_bow_fc(unit_counts_bow))
         del unit_counts_bow
         embedded_scalar_list.append(x)
@@ -134,6 +138,18 @@ class Baseline(nn.Module):
         # The embedding is also added to `scalar_context`
 
         cumulative_statistics = []  # it is different in different baseline
+        # 不同的类型使用不同计算方式
+        '''
+        通道	衡量什么	奖励怎么来	距离度量	mAS 现状	损失权重 (vtrace, baseline)
+        winloss	这局赢没赢	游戏终局真实奖励（±1）	—	✅ 使用	(10.0, 5.0)，另享 UPGO
+        build_order	建造顺序像不像人类	与 z 的建造顺序的差异	Levenshtein（编辑距离）	✅ 使用	(4.0, 1.0)
+        built_units	部队构成像不像人类	与 z 的单位数量词袋的差异	Hamming（逐位差异）	✅ 使用	(6.0, 1.0)
+        upgrades	科技升级像不像人类	与 z 的升级集合的差异	Hamming	⚠️ 权重置 0，未启用	(6.0, 1.0)
+        effects	技能效果像不像人类	与 z 的效果集合的差异	Hamming	⚠️ 权重置 0，未启用	(6.0, 1.0)
+
+        其余具体看md文档
+        '''
+        # 这里也是同上，只是根据不同的评判基准
         if self.baseline_type == "winloss" or self.baseline_type == "build_order" or self.baseline_type == "built_units":
             x = F.relu(self.units_buildings_fc(units_buildings))
             cumulative_statistics.append(x)
@@ -158,33 +174,48 @@ class Baseline(nn.Module):
 
         batch_size = beginning_build_order.shape[0]
 
+        # 这三行是在给“开局建造顺序”这个序列做位置编码（positional encoding）——给 20 个建造步骤的每一步打上“你是第几步”的标签，让后面的 Transformer 能感知顺序。
         seq = torch.arange(SCHP.count_beginning_build_order)
+        # SCHP.count_beginning_build_order = 20
+        # → tensor([0, 1, 2, ..., 19])，形状 [20]
+        # 含义：20 个建造步骤的"序号"
         seq = L.tensor_one_hot(seq, SCHP.count_beginning_build_order)
+        # 每个序号转成 one-hot：[20] → [20, 20]
+        # 第 0 行 = [1,0,0,...,0]，第 1 行 = [0,1,0,...,0] ...
+        # 数学上就是 torch.eye(20)（单位矩阵）
         seq = seq.unsqueeze(0).repeat(batch_size, 1, 1).to(beginning_build_order.device)
+        # [20,20] → [1,20,20] → [batch,20,20]
+        # 给 batch 里每个样本复制同一份位置编码（位置与样本无关，天然共享）
+        # .to(...) 搬到与建造顺序特征相同的设备（GPU）
 
-        bo_sum = beginning_build_order.sum(dim=-1, keepdim=False)
-        bo_sum = bo_sum.sum(dim=-1, keepdim=False)
-        bo_sum = bo_sum.unsqueeze(1)
-        bo_sum = bo_sum.repeat(1, SCHP.count_beginning_build_order)
+        bo_sum = beginning_build_order.sum(dim=-1, keepdim=False) # 将最后一个维度one-hot编码合并，[batch, 20, E] → [batch, 20]：每行 one-hot 求和
+        bo_sum = bo_sum.sum(dim=-1, keepdim=False) # 已建造的行：one-hot 有一个 1 → 行和 = 1 ，计算合并后的和，从而得到建造了几个建筑，没有建造建筑的行为全零
+        bo_sum = bo_sum.unsqueeze(1) # 插一维，为展开做准备
+        bo_sum = bo_sum.repeat(1, SCHP.count_beginning_build_order) 
+        # [batch, 1] → [batch, 20]：同一个数复制 20 份
+        # 样本A: [3, 3, 3, ..., 3]    样本B: [5, 5, 5, ..., 5]  
 
+        # 掩码，因为可能还在建造这么多建筑，所以需要知道哪些位置是还没建造建筑的地方
         mask = torch.arange(SCHP.count_beginning_build_order)
         mask = mask.unsqueeze(0).repeat(batch_size, 1).to(bo_sum.device)
         mask = mask < bo_sum
         mask = mask.unsqueeze(2).repeat(1, 1, SCHP.count_beginning_build_order)
 
         # add the seq info, referenced by the processing way of DI-star
-        x = torch.cat([beginning_build_order, seq], dim=2)
-        x = self.before_beginning_build_order(x)
+        x = torch.cat([beginning_build_order, seq], dim=2) # 将建造建筑和建造顺序拼接起来
+        x = self.before_beginning_build_order(x) # 混合提取特征
 
         # like in entity encoder, we add a sequence mask
-        x = self.beginning_build_order_transformer(x, mask=mask)
+        x = self.beginning_build_order_transformer(x, mask=mask) # 提取特征
         x = x.reshape(x.shape[0], SCHP.count_beginning_build_order * self.build_order_model_size)
 
-        embedded_scalar_list.append(x)
-        embedded_scalar = torch.cat(embedded_scalar_list, dim=1)
+        embedded_scalar_list.append(x) # 将建造顺序和建造建筑的特征也添加进去
+        embedded_scalar = torch.cat(embedded_scalar_list, dim=1) # 然后将特征cat起来，cat要求拼接维度以外的维度相同就可以拼接，这里就相当于
+        # 把不通特征都拼接到一个list列表中
 
         del x, mask, bo_sum, seq, embedded_scalar_list
 
+        # 返回一个混合了对局势评价的特征提取后的特征矩阵
         return embedded_scalar
 
     def forward(self, lstm_output, various_observations, opponent_observations=None):
