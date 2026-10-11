@@ -144,6 +144,9 @@ class ArchModel(nn.Module):
         其他信息具体看md文档,总之这个state小地图每个通道针对不同的特征进行了分配，方便表示不通的特征在小地图上的分布
 
         obs_list:obs_list 是一个可选的 Python 列表，装有原始 PySC2 观测字典（不是 ScalarEncoder 处理过的标量特征）,没有经过处理提取的特征信息
+        baseline_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+        baseline_opponent_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+        baseline_state、baseline_opponent_state 具体看md文档
         '''
         # shapes of embedded_entity, embedded_spatial, embedded_scalar are all [batch_size x embedded_size]
         # 对游戏状态中的实体单位进行潜入编码
@@ -190,7 +193,7 @@ class ArchModel(nn.Module):
         del state
 
         '''
-        lstm_output: (batch_size * sequence_length, hidden_dim) 
+        lstm_output: (batch_size * sequence_length, hidden_dim) lstm_output 是 Core（主干 LSTM）每个时间步的输出——整个模型的"局势记忆"：它把当前帧的三路信息（标量统计、实体、地图）与过去所有帧的记忆（hidden_state）融合成一个向量，作为后续所有动作 head 的总出发点。MiniStar 下形状是 [batch×seq, 128]，由 三路编码器输出拼接 → LSTM 计算得出
         hidden_state: 一个元组 (h_n, c_n)，分别是隐藏状态和细胞状态。
         '''
         lstm_output, hidden_state = self.core(embedded_scalar, embedded_entity, embedded_spatial, 
@@ -288,20 +291,24 @@ class ArchModel(nn.Module):
         '''
         这里根据地图信息以及选择的物体信息，动作类型对目标点击位置进行决策
         target_location_logits: (B, 64(map_size), 64(map_size)), 地图每个像素的分数（用于 loss / RL 采样）
-        target_location: [B, 2] 采样出的坐标 [x, y]
+        target_location: [B, 2] 采样出鼠标点击的目标坐标 [x, y]
         '''
         target_location_logits, target_location = self.location_head(autoregressive_embedding, action_type, map_skip)
 
         action_logits = ArgsActionLogits(action_type=action_type_logits, delay=delay_logits, queue=queue_logits,
                                          units=units_logits, target_unit=target_unit_logits, 
                                          target_location=target_location_logits)
+
         action = ArgsAction(action_type=action_type, delay=delay, queue=queue,
                             units=units, target_unit=target_unit, target_location=target_location)
 
         if multi_gpu_supvised_learning:
+            # multi_gpu_supvised_learning 是多卡监督学习的"返回格式逃生舱"——因为 DDP 处理不了嵌套 namedtuple 的输出，模型在多卡模式下改吐裸张量、由专门的 loss 函数逐个接住；但这条多卡链路本身是项目里不推荐使用的实验性代码
+            # 具体看md文档：
             return action_type, entity_nums, units, target_unit, target_location, action_type_logits, delay_logits, queue_logits, \
                 units_logits, target_unit_logits, target_location_logits, select_units_num
 
+        # 释放内存
         print('entity_nums.shape:', entity_nums.shape) if debug else None
         print('select_units_num.shape:', select_units_num.shape) if debug else None
 
@@ -313,6 +320,11 @@ class ArchModel(nn.Module):
         if return_logits:
 
             if return_baseline:
+                '''
+                lstm_output: (batch_size * sequence_length, hidden_dim)  是 Core（主干 LSTM）每个时间步的输出——整个模型的"局势记忆"：它把当前帧的三路信息（标量统计、实体、地图）与过去所有帧的记忆（hidden_state）融合成一个向量，作为后续所有动作 head 的总出发点
+                baseline_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+                baseline_opponent_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+                '''
                 winloss_baseline_value = self.winloss_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)
                 build_order_baseline_value = self.build_order_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)
                 built_units_baseline_value = self.built_units_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)

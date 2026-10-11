@@ -37,6 +37,14 @@ class ArgsAction(object):
     def __init__(self, action_type=-1, delay=SCHP.sc2_default_delay, queue=None, 
                  units=None, target_unit=None, 
                  target_location=None):
+        '''
+        action_type: 选择的动作（随机采样或者外部传入的专家动作）shape (batch, 1)
+        delay： 实际的操作延迟（采样或者外部传入的专家）
+        queue: 针对queue_logits的采样或者外部传入的专家数据 （batch，1）
+        units：[batch_size x select_units x 1] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测采样的实体id
+        target_unit：根据动作选择的目标实体索引（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为entity_size - 1 [batch_size x 1 x 1]
+        target_location: [B, 2] 采样出鼠标点击的目标坐标 [x, y]
+        '''
         super(ArgsAction, self).__init__()
         self.action_type = action_type
         self.delay = delay
@@ -275,6 +283,15 @@ class ArgsActionLogits(object):
 
     def __init__(self, action_type, delay, queue, units, 
                  target_unit, target_location):
+
+        '''
+        action_type_logits: 预测选择动作的logits分布 shape (batch, max_action_num)
+        delay_logits: 预测操作延迟的logits分布
+        queue_logits: 根据autoregressive_embedding判断接下来的动作是排队还是立即执行 （batch，max_queue）
+        units_logits shape is [batch_size x max_selected x entity_size] 其中有部分是padding，如果没有选择满最大选择实体单位的话，表示每次预测的实体logit分布
+        target_unit_logits: 每一个样本根据动作生成的选择实体目标的logits分布（针对 entity_embeddings 选择实体），但是如果动作类型不需要选择目标的全部设置为0 [batch_size x 1 x entity_size]
+        target_location_logits: (B, 64(map_size), 64(map_size)), 地图每个像素的分数（用于 loss / RL 采样）
+        '''
         super(ArgsActionLogits, self).__init__()
         self.action_type = action_type
         self.delay = delay

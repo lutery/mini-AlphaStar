@@ -80,6 +80,20 @@ class Baseline(nn.Module):
         self.out_fc = nn.Linear(original_256, 1) 
 
     def pre_forward(self, various_observations):
+        '''
+        various_observations,：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+        '''
+
+        '''
+        agent_statistics: 矿/气/人口/军队价值等运营统计, shape (batch, 10)
+        upgrades: 已研发的科技升级（布尔）, shape (batch, 320)
+        unit_counts_bow: 各兵种当前数量（词袋）（batch，1）
+        units_buildings: 累计造过哪些单位/建筑（布尔） （batch， 1）
+        effects: 累计触发过哪些效果（布尔） （batch, 1)
+        upgrade: 累计升级统计（布尔） (batch, 320)
+        beginning_build_order: 开局前 20 个建造顺序 (batch, 20, 建筑的嵌入维度）
+        cumulative_score: 游戏累计积分 这些是游戏内部追踪的积分指标，只给 baseline 用、推理时不可见、人类玩家游戏中也看不到——包括总分、闲置生产/工作时间、单位与建筑总价值、摧毁总价值、采集矿/气总量与速率、支出总量等 13 项。相当于“考官专用的成绩单”：训练时 Critic 可以看它来判断局势好坏，但策略网不能看（避免依赖打分作弊）。相当于全图信息
+        '''
         [agent_statistics, upgrades, unit_counts_bow,
          units_buildings, effects, upgrade, beginning_build_order, cumulative_score] = various_observations
 
@@ -174,6 +188,11 @@ class Baseline(nn.Module):
         return embedded_scalar
 
     def forward(self, lstm_output, various_observations, opponent_observations=None):
+        '''
+        lstm_output: (batch_size * sequence_length, hidden_dim)  是 Core（主干 LSTM）每个时间步的输出——整个模型的"局势记忆"：它把当前帧的三路信息（标量统计、实体、地图）与过去所有帧的记忆（hidden_state）融合成一个向量，作为后续所有动作 head 的总出发点
+        various_observations,：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+        opponent_observations：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
+        '''
         # check and improve it
         player_scalar_out = self.pre_forward(various_observations)
         del various_observations
