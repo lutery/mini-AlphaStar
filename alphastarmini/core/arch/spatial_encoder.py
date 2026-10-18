@@ -410,6 +410,8 @@ class ResBlock1D(nn.Module):
         # Note, because Layer norm doesn't average over dim of batch (N), so
         # it is the same in training and evaluating.
         # For Batch Norm, this is not the case.
+        # 这里填入planes, seq_len是因为需要讲输入的样本最后
+        # 几个维度做各自样本的归一化
         self.ln1 = nn.LayerNorm([planes, seq_len])
         self.conv2 = nn.Conv1d(planes, planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)

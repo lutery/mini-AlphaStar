@@ -216,6 +216,7 @@ class Baseline(nn.Module):
         del x, mask, bo_sum, seq, embedded_scalar_list
 
         # 返回一个混合了对局势评价的特征提取后的特征矩阵
+        # shape 应该是【batch，512】
         return embedded_scalar
 
     def forward(self, lstm_output, various_observations, opponent_observations=None):
@@ -225,22 +226,29 @@ class Baseline(nn.Module):
         opponent_observations：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
         '''
         # check and improve it
+        # 返回一个混合了对局势评价的特征提取后的特征矩阵
+        #【batch，512】
         player_scalar_out = self.pre_forward(various_observations)
         del various_observations
 
         # AlphaStar: The baseline extracts those same observations from `opponent_observations`.
         if opponent_observations is not None:
+            # 对手的局势信息（是对手自己的视角数据），私有数据，方便评分
             opponenet_scalar_out = self.pre_forward(opponent_observations)
             del opponent_observations
         else:
+            # 如果没有传递则对手的数据为空
             opponenet_scalar_out = torch.zeros_like(player_scalar_out)
 
         # AlphaStar: These features are all concatenated together to yield `action_type_input`
+        # 拼接历史局势的整条记忆，玩家视角的局势特征提取矩阵，对手视角的特征提取矩阵
         action_type_input = torch.cat([lstm_output, player_scalar_out, opponenet_scalar_out], dim=1)
         del lstm_output, player_scalar_out, opponenet_scalar_out
         print("action_type_input.shape:", action_type_input.shape) if debug else None
 
         # AlphaStar: passed through a linear of size 256
+        # 对整个局势的特征矩阵进行特征缓和提取
+        # 特征压缩
         x = self.embed_fc(action_type_input)
         del action_type_input
         print("x.shape:", x.shape) if debug else None
@@ -248,6 +256,7 @@ class Baseline(nn.Module):
         # AlphaStar: then passed through 16 ResBlocks with 256 hidden units and layer normalization,
         # Note: tje layer normalization is already inside each resblock
         x = x.unsqueeze(-1)
+        # 特征融合
         for resblock in self.resblock_stack:
             x = resblock(x)
         x = x.squeeze(-1)    
@@ -258,14 +267,18 @@ class Baseline(nn.Module):
 
         # AlphaStar: then passed through a linear with 1 hidden unit.
         baseline = self.out_fc(x)
+        # 到这里完成了特征的提取
         print("baseline:", baseline) if debug else None
 
         # AlphaStar: This baseline value is transformed by ((2.0 / PI) * atan((PI / 2.0) * baseline)) and is used as the baseline value
+        # 这是 Baseline（Critic）输出的“软压缩”变换——一个 S 形函数，把 Linear 层的无界输出压进 (−1, 1) 区间
+        # 具体看md文档
         out = (2.0 / np.pi) * torch.atan((np.pi / 2.0) * baseline)
         print("out:", out) if debug else None
 
         del x, baseline
 
+        # 返回每个样本的评价值，范围-1～1之间
         return out
 
 

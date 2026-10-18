@@ -360,3 +360,7 @@ baseline_state_op = get_baseline_state_from_multi_source_state(state_op)
 ## 总结
 
 一句话：**`baseline_state` / `baseline_opponent_state` 是 Critic 专属的“局势成绩单”——从 16 项标量状态中挑出 7 项局面性特征（运营统计、升级、部队词袋、累计建筑/效果/升级、开局建造顺序），再附上策略不可见的 `cumulative_score` 游戏积分，我方一份、对方一份（自战才采集）；它们让 5 个价值网络能比策略看到更多、更准的局势信息，从而给出更稳的优势估计。**
+
+
+---
+

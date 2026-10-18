@@ -317,14 +317,16 @@ class ArchModel(nn.Module):
         del entity_embeddings, autoregressive_embedding, map_skip
         del target_location_logits, unit_type_entity_mask
 
-        if return_logits:
+        if return_logits: # 返回值包含执行动作的logit分布值
 
-            if return_baseline:
+            if return_baseline: # 返回值包含评价基线值
                 '''
                 lstm_output: (batch_size * sequence_length, hidden_dim)  是 Core（主干 LSTM）每个时间步的输出——整个模型的"局势记忆"：它把当前帧的三路信息（标量统计、实体、地图）与过去所有帧的记忆（hidden_state）融合成一个向量，作为后续所有动作 head 的总出发点
                 baseline_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
                 baseline_opponent_state：是专门喂给 5 个 Baseline（Critic）的“标量观测包”——各含 8 项特征：从主模型的 16 项标量状态里挑出 7 项与“局势估值”相关的（资源、升级、部队构成、建造顺序等），再补一项 Critic 专属的 cumulative_score（游戏累计积分，人类玩家都看不到）。前者来自我方视角的观测，后者来自对方视角；打内置电脑时对方观测拿不到，传 None（内部用全零代替）
                 '''
+                # # 返回每个样本的评价值，范围-1～1之间
+                # 具体看md文档
                 winloss_baseline_value = self.winloss_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)
                 build_order_baseline_value = self.build_order_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)
                 built_units_baseline_value = self.built_units_baseline.forward(lstm_output, baseline_state, baseline_opponent_state)
