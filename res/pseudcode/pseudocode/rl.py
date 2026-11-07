@@ -472,6 +472,8 @@ def loss_function(agent, trajectories):
     # outputs the probability of victory, and one for each pseudo-reward
     # associated with following the human strategy statistic z.
     # See the paper methods and detailed_architecture.txt for more details.
+    # 按照不同的reward，计算不同的轮式
+    # 
     for baseline, costs_and_rewards in zip(baselines,
                                            BASELINE_COSTS_AND_REWARDS):
         pg_cost, baseline_cost, reward_name = costs_and_rewards

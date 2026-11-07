@@ -159,10 +159,12 @@ def human_policy_kl_loss_action(target_logits, trajectories):
 
 def td_lambda_loss(baselines, rewards, trajectories, device): 
 
+    # trajectories.is_final：获取的是当前轨迹是否到了游戏结束的时候，true表示结束
+    # ~np.array：然后就是对结果取反，然后true就表示还没结束
     discounts = ~np.array(trajectories.is_final[:-1], dtype=np.bool)  # note, use '~' must ensure the type is bool
     discounts = torch.tensor(discounts, device=device)
 
-    baselines = baselines
+    baselines = baselines # 预测的价值，bellma公式中target的Q值
     rewards = rewards[:-1]  # rewards should be T_0 -> T_{n-1}
 
     with torch.no_grad():
@@ -188,19 +190,19 @@ def get_baseline_hyperparameters():
     # Accroding to detailed_architecture.txt, baselines contains the following 5 items:
     # Thus BASELINE_COSTS_AND_REWARDS also have 5 entry
     # winloss_baseline_costs = (1.0, 10.0, "winloss_baseline") 
-    winloss_baseline_costs = WINLOSS_BASELINE_COSTS
+    winloss_baseline_costs = WINLOSS_BASELINE_COSTS # 计算的损失仅管输赢，不加工
 
     # AlphaStar: The updates are computed similar to Winloss, except without UPGO, applied using Build Order baseline, and 
     # with relative weightings 4.0 for the policy and 1.0 for the baseline.
-    build_order_baseline_costs = (4.0, 1.0, "build_order_baseline")
+    build_order_baseline_costs = (4.0, 1.0, "build_order_baseline") # 只管建造顺序损失
 
     # AlphaStar: The updates are computed similar to Winloss, except without UPGO, applied using Built Units baseline, 
     # and with relative weightings 6.0 for the policy and 1.0 for the baseline.
-    built_units_baseline_costs = (6.0, 1.0, "built_units_baseline")
+    built_units_baseline_costs = (6.0, 1.0, "built_units_baseline") # 尽管建造单位损失
 
     # AlphaStar: The updates are computed similar to Winloss, except without UpGO, applied using Upgrades baseline, and 
     # with relative weightings 6.0 for the policy and 1.0 for the baseline.
-    upgrades_baseline_costs = (6.0, 1.0, "upgrades_baseline")
+    upgrades_baseline_costs = (6.0, 1.0, "upgrades_baseline") # 
 
     # AlphaStar: The updates are computed similar to Winloss, except without UPGO, applied using Effects baseline, and 
     # with relative weightings 6.0 for the policy and 1.0 for the baseline.
@@ -213,12 +215,13 @@ def get_baseline_hyperparameters():
 
 
 def transpose_target_logits(target_logits):
-    for i, field in enumerate(ACTION_FIELDS):  
-        logits = getattr(target_logits, field) 
+    # 把 rl_unroll 输出的 6 个动作字段 logits 从 [batch, seq, …]（B 在前） 换成 [seq, batch, …]（T 在前）——因为后面所有 RL 算法（λ-回报、V-trace、UPGO）都是沿着第 0 维=时间轴做递推扫描的。
+    for i, field in enumerate(ACTION_FIELDS):  # 遍历模型预测的动作类型
+        logits = getattr(target_logits, field) # 取出对应动作的字段，如：目标位置、选择的单位
         #logits = logits.view(AHP.batch_size, AHP.sequence_length, *tuple(logits.shape[1:]))
-        logits = logits.transpose(0, 1).contiguous()
-        logits = logits.view(AHP.sequence_length, AHP.batch_size, *tuple(logits.shape[2:]))
-        setattr(target_logits, field, logits)
+        logits = logits.transpose(0, 1).contiguous() # 交换SEQ和BATCH两个字段
+        logits = logits.view(AHP.sequence_length, AHP.batch_size, *tuple(logits.shape[2:])) 
+        setattr(target_logits, field, logits) # 重新设置回target_logits
 
     del logits
     return target_logits
@@ -235,6 +238,12 @@ def transpose_sth(x):
 
 
 def get_useful_masks(select_units_num, entity_num, device):
+    '''
+    它解决的是 RL 张量化里一个躲不开的问题：SC2 的实体数量和选兵数量每一步都在变，而张量必须是定长的
+
+    select_units_num[t,b]：第 b 条轨迹第 t 步实际选了几个兵。选兵是变长序列，但张量必须开到 max_selected（MiniStar 笔记本配置 = 48/16 = 3，服务器 = 12）；
+    entity_num[t,b]：那一步场上真实实体个数（可能几十个），但实体表张量固定开 max_entities = 512（hyper_parameters.py:208 注释明确说这个值不能缩减）。
+    '''
     max_selected = AHP.max_selected + 1
     extend_select_units_num = select_units_num + 1
 
@@ -450,11 +459,13 @@ def loss_function(agent, trajectories, use_opponent_state=True,
     device = target_logits.action_type.device
 
     # transpose to [seq_size x batch_size x -1]
-    target_logits = transpose_target_logits(target_logits)
-    baselines = transpose_baselines(baselines)
+    target_logits = transpose_target_logits(target_logits) # 调整动作维度顺序
+    # 传进本函数的是 5 个形状 [B, T] 的张量组成的 list——baselines[k][b][t] = 第 k 路奖励、第 b 条轨迹、第 t 步的价值估计。这 5 路正好对应第 2 步讲过的 5 种伪奖励（实际 3 路有效），每路配一个专属价值头。
+    baselines = transpose_baselines(baselines) # 它把 5 个价值头（baseline）输出的 V(s_t) 从 [B, T] 转成 [T, B]——和 logits 换轴的动机完全相同：下游所有 TD 计算都要沿第 0 维（时间）做 [:-1] / [1:] 的错位切片。
 
     # transpose to [seq_size x batch_size x -1]
-    select_units_num = transpose_sth(select_units_num)
+    # 以下也同上，调换维度的顺序
+    select_units_num = transpose_sth(select_units_num) 
     entity_num = transpose_sth(entity_num)
 
     # get used masks
@@ -463,6 +474,7 @@ def loss_function(agent, trajectories, use_opponent_state=True,
 
     # note, we change the structure of the trajectories
     # shape before: [dict_name x batch_size x seq_size]
+    # 以下两个方法具体看md文档
     trajectories = RU.stack_namedtuple(trajectories) 
 
     # shape after: [dict_name x seq_size x batch_size]
@@ -485,16 +497,17 @@ def loss_function(agent, trajectories, use_opponent_state=True,
             if reward_index != 0:
                 break
 
+        # 提取超参数
         vtrace_cost, baseline_cost, reward_name = costs_and_rewards
         print("reward_name:", reward_name) if debug else None
 
-        rewards = PR.compute_pseudoreward(trajectories, reward_name, device)
+        rewards = PR.compute_pseudoreward(trajectories, reward_name, device) # 获取轨迹奖励
         print("rewards:", rewards) if 0 else None
         print("rewards not 0:", rewards[rewards != 0]) if 0 else None
 
         # The action_type argument, delay, and all other arguments are separately updated 
         # using a separate ("split") VTrace Actor-Critic losses. 
-        baseline_weight = learner_baseline_weight
+        baseline_weight = learner_baseline_weight # 看来是评价权重
         loss_baseline = td_lambda_loss(baseline, rewards, trajectories, device)
         loss_baseline = baseline_cost * loss_baseline
         loss_baseline = baseline_weight * loss_baseline

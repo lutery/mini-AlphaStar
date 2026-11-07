@@ -92,7 +92,9 @@ def multistep_forward_view(rewards, pcontinues, state_values, lambda_,):
     # This matches the form of scan_discounted_sum:
     #   result = scan_sum_with_discount(sequence, discount,
     #                                   initial_value = state_values[last])
-
+    
+    # 这里其实就是ppo的轨迹回报累计计算
+    # 只是这里优先计算每一个点的bellman价值
     sequence = rewards + pcontinues * state_values * (1 - lambda_)
     discount = pcontinues * lambda_
 
