@@ -224,3 +224,62 @@ print(zipped.reward[1])     # (1, 3)  ← t=1 时刻所有 batch 的 reward
 ---
 
 语法地基打完，`loss_function()` 预处理段（447-472 行）你现在应该能逐行读懂了。回复“**下一步**”，进入第 3 步：TD(λ) 价值学习。
+
+-------
+
+这两行都是给价值损失（`td_lambda_loss` 的输出）**乘权重**，但两个系数的来源和作用层面完全不同。我刚把两条调用链都核实了一遍：
+
+## 一句话结论
+
+`baseline_cost` 是**每路奖励各不相同、写死在超参数里的静态权重**（来自 AlphaStar 论文的 relative weightings）；`baseline_weight` 是**所有路统一、由训练器传进来的运行时总旋钮**（本项目中恒为 1）。两者连乘后得到这条奖励流的价值损失的最终权重。
+
+## 两个系数的来源
+
+**`baseline_cost`——静态、按路设置**
+
+第 501 行从元组解包来：`vtrace_cost, baseline_cost, reward_name = costs_and_rewards`，源头是 `get_baseline_hyperparameters()`：
+
+| 奖励路 | (vtrace_cost, **baseline_cost**) | 价值损失权重 |
+|---|---|---|
+| winloss | (10.0, **5.0**) | 5.0 |
+| build_order | (4.0, **1.0**) | 1.0 |
+| built_units | (6.0, **1.0**) | 1.0 |
+| upgrades / effects | (6.0, **1.0**) | 1.0 |
+
+它编码的是论文里的设计决策：**胜负的价值头要重点学**（5 倍权重），距离类奖励的价值头只做辅助（1 倍）。对照同一循环里 vtrace 侧的兄弟代码（第 519-522 行 `vtrace_cost * vtrace_weight`），还能读出每路“策略学习 : 价值学习”的配比——winloss 是 10:5（策略是价值的 2 倍），伪奖励路全是 4:1、6:1（策略远重于价值）。直觉：伪奖励路的价值头只是给策略梯度提供降噪用的优势，不必学得极准；winloss 是主目标，价值要学扎实。
+
+**`baseline_weight`（即 `learner_baseline_weight`）——动态、全局统一**
+
+调用链一路传下来：
+
+```
+rl_vs_inner_bot_mp.py:75   BASELINE_WEIGHT = 1          ← 启动器定义
+        ↓ 701 行传给
+learner.py:52/104          self.baseline_weight = 1     ← Learner 构造参数，存成属性
+        ↓ 249 行传给
+rl_loss.py:452             learner_baseline_weight=1    ← loss_function 的形参
+        ↓ 510 行
+rl_loss.py:513             loss_baseline = baseline_weight * loss_baseline
+```
+
+它和 `baseline_cost` 的三点区别：① **不分路**，5 路价值损失乘同一个数；② **不在 loss 里定义**，而是训练系统外部可调的旋钮——你想“整体放大/缩小价值学习强度”（比如价值头收敛太慢时临时加大）时动它，不用改代码里的分路配比；③ 在本项目的两条启动路径里**都恒为 1**（`BASELINE_WEIGHT = 1`），即当前实际不起作用——但接线留好了，这就是“设计期权重”和“运行期权重”分层的老练做法。
+
+## 合起来的效果
+
+```
+loss_baseline(最终) = baseline_cost(按路: 5.0 或 1.0) × baseline_weight(全局: 1) × td_lambda_loss
+```
+
+两行拆开写而不是合并成一个系数，正是为了保持“分路配比”和“全局缩放”这两个语义独立的自由度各自可调。
+
+## 顺带纠正一个注释
+
+你在第 510 行写的“看来是评价权重”不太准确——`baseline_weight` 是**价值损失（baseline 头）的总权重**，“评价”在 RL 语境里通常指 critic/价值，这样写以后回看容易歧义，建议改成“价值损失的全局权重（运行时可调，默认 1）”。
+
+## 自测
+
+1. 假设你观察到 winloss 的价值曲线收敛明显慢于伪奖励路，想**只**加大 winloss 价值学习的力度——动 `baseline_cost` 还是 `baseline_weight`？想五路一起加大呢？
+2. `only_update_baseline=True` 时（第 518 行），价值损失还受不受这两个系数影响？（提示：`vtrace_weight` 只乘在 vtrace 那边。）
+3. 为什么伪奖励路的价值头权重全给 1.0，唯独 winloss 给 5.0？联系第 2 步讲的“伪奖励量级被 0.05 缩放、0.8 封顶”想想。
+
+回复“**下一步**”进入第 4 步：V-trace。

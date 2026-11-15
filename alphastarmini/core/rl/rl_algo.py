@@ -120,6 +120,7 @@ def scan_discounted_sum(sequence, decay, initial_value, reverse=False):
       reverse: Whether to process the sum in a reverse order.
     Returns:
       Cumulative sum with discount. Same shape and type as `sequence`.
+    todo 后面再看
     """
 
     elems = [sequence, decay]

@@ -167,13 +167,13 @@ def td_lambda_loss(baselines, rewards, trajectories, device):
     baselines = baselines # 预测的价值，bellma公式中target的Q值
     rewards = rewards[:-1]  # rewards should be T_0 -> T_{n-1}
 
-    with torch.no_grad():
+    with torch.no_grad(): # 这里之所以加no_gard，是因为不能将梯度从这里流过去，否则模型为了能够预测对，会通过修改returns的值，从而导致预测的价值不对
         returns = RA.lambda_returns(baselines[1:], rewards, discounts, lambdas=0.8)
 
     print('returns', returns) if debug else None
     print('baselines[0]', baselines[0]) if debug else None
 
-    result = returns - baselines[:-1]
+    result = returns - baselines[:-1] # 对比模型预测的价值和计算出来的回报之间的差值，从而拉近两者的距离进行训练
     print('result', result) if debug else None
 
     del discounts, baselines, rewards, returns
@@ -268,11 +268,22 @@ def get_useful_masks(select_units_num, entity_num, device):
 
 
 def sum_vtrace_loss(target_logits_all, trajectories, baselines, rewards, selected_mask, entity_mask, device):
+    '''
+    target_logits_all	目标策略 π 的 logits	6 个字段各不相同（见下）	是（唯一）
+    trajectories	actor 采样时记录的一切	Trajectory 22 字段，[时间][batch]	否（纯数据）
+    baselines	本路价值 V(s_t)	[T, B]	否（no_grad 使用）
+    rewards	本路奖励流	[T, B]	否
+    selected_mask	选兵序列有效槽位	[T, B, 4]（3 兵+1 停止符）	否
+    entity_mask	实体表有效位置	[T, B, 512]	否
+    device	计算设备	cuda:0 / cpu	—
+    '''
     """Computes the split v-trace policy gradient loss."""
     print('sum_vtrace_pg_loss') if debug else None
 
-    trajectories = Trajectory(*tuple(item[:-1] for item in trajectories))
-    discounts = torch.tensor(~np.array(trajectories.is_final, dtype=np.bool), dtype=torch.float32, device=device)
+    # 遍历 trajectories 中的每一个成员，然后取出每一个成员的最后一步，然后重新组装成一个新的 Trajectory
+    trajectories = Trajectory(*tuple(item[:-1] for item in trajectories)) 
+    discounts = torch.tensor(~np.array(trajectories.is_final, dtype=np.bool), dtype=torch.float32, device=device) # 又是得到 1 标识没结束；0 标识结束
+    # unit_type_entity_mask：当前这步选的这个动作类型，按游戏规则允许选中场上哪些实体
     unit_type_entity_mask = torch.tensor(np.array(trajectories.unit_type_entity_mask), dtype=torch.float32, device=device)
 
     values = baselines[:-1]
@@ -508,11 +519,12 @@ def loss_function(agent, trajectories, use_opponent_state=True,
         # The action_type argument, delay, and all other arguments are separately updated 
         # using a separate ("split") VTrace Actor-Critic losses. 
         baseline_weight = learner_baseline_weight # 看来是评价权重
-        loss_baseline = td_lambda_loss(baseline, rewards, trajectories, device)
+        loss_baseline = td_lambda_loss(baseline, rewards, trajectories, device) # 得到价值预测误差
+        # 这两行都是给价值损失（td_lambda_loss 的输出）乘权重
         loss_baseline = baseline_cost * loss_baseline
         loss_baseline = baseline_weight * loss_baseline
-        loss_dict.update({reward_name + "-loss_baseline:": loss_baseline.item()})
-        loss_actor_critic += loss_baseline
+        loss_dict.update({reward_name + "-loss_baseline:": loss_baseline.item()}) # 跟踪打印输出
+        loss_actor_critic += loss_baseline # 为什么要乘以以上两个 baseline_cost 和  baseline_weight，看md文档
 
         # we add vtrace loss
         vtrace_weight = 0 if only_update_baseline else 1
