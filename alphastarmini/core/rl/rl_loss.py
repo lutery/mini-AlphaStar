@@ -295,9 +295,12 @@ def sum_vtrace_loss(target_logits_all, trajectories, baselines, rewards, selecte
     fields_weight = FIELDS_WEIGHT_1
 
     loss = 0.
+    # ACTION_FIELDS：遍历所有预测的动作
     for i, field in enumerate(ACTION_FIELDS):
         target_log_prob, clipped_rhos, masks = get_logprob_and_rhos(target_logits_all, field, trajectories, mask_provided)
         with torch.no_grad():
+            # 	vs	V-trace 价值目标（多步修匀后的价值）	[T−1, B]	已 detach，无
+            #   pg_advantages	策略梯度要乘的优势 A_t	[T−1, B]	已 detach，无
             weighted_advantage = RA.vtrace_advantages(clipped_rhos, rewards, discounts, values, baselines[-1])[1].reshape(-1)
 
         loss_field = (-target_log_prob) * weighted_advantage * masks.reshape(-1)
@@ -395,6 +398,13 @@ def change_units_and_logits(behavior_logits, gt_units, select_units_num, entity_
 
 
 def get_logprob_and_rhos(target_logits_all, field, trajectories, mask_provided):
+    '''
+    target_logits_all: 预测的动作logits分布
+    field：当前要处理的动作类型
+    trajectories：采样时记录的一切	Trajectory 22 字段，[时间][batch]	否（纯数据）
+    mask_provided： 掩码，用来确认哪些位置的数据是有效的
+    '''
+    # 从预测的动作中提取对应的动作预测
     target_logits = getattr(target_logits_all, field)[:-1]
     device = target_logits.device
     [selected_mask, entity_mask, unit_type_entity_mask] = mask_provided
@@ -404,9 +414,10 @@ def get_logprob_and_rhos(target_logits_all, field, trajectories, mask_provided):
     seqbatch_shape = sequence_length * batch_size
     target_logits = target_logits.view(seqbatch_shape, *tuple(target_logits.shape[2:]))
 
-    behavior_logits = filter_by_for_lists(field, trajectories.behavior_logits, device)
-    actions = filter_by_for_lists(field, trajectories.action, device)
-    masks = filter_by_for_masks(field, trajectories.masks, device)
+    # 从预测的list中提取 field 对应的动作预测
+    behavior_logits = filter_by_for_lists(field, trajectories.behavior_logits, device) # actor 打游戏当时，策略给每个动作打的分。那是“过去的你”
+    actions = filter_by_for_lists(field, trajectories.action, device) # 实际执行的动作
+    masks = filter_by_for_masks(field, trajectories.masks, device) # 该字段的有效性
     max_selected = AHP.max_selected + 1
 
     all_logits = [target_logits, behavior_logits]
@@ -455,6 +466,7 @@ def get_logprob_and_rhos(target_logits_all, field, trajectories, mask_provided):
     del behavior_log_prob, target_logits, behavior_logits, all_logits, target_logits_all
     del actions, selected_mask, entity_mask, unit_type_entity_mask, mask_used, max_selected
 
+    # target_log_prob（带梯度，用于学习）、clipped_rhos（折扣率）、masks（有效位）
     return target_log_prob, clipped_rhos, masks
 
 

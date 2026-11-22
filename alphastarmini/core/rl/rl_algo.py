@@ -204,6 +204,31 @@ def vtrace_from_importance_weights(
           train a baseline (V(x_t) - vs_t)^2.
         pg_advantages: A float32 tensor of shape `[T, B]`. Can be used as the
           advantage in the calculation of policy gradients.
+
+    rhos 重要性权重 ρ_t = π(a)/μ(a)，“旧经验打几折”	[T, B]
+    discounts	γ_t：这步之后游戏还继续吗（继续=1，终局=0）	[T, B]	
+    rewards	本路奖励流 r_t	[T, B]
+    values	价值头对当前状态的估计 V(s_t)	[T, B]
+    bootstrap_value	序列末端的价值 V(s_{T-1})	[B]
+    clip_rho_threshold	算价值目标 vs 时 ρ 的截断上界 ρ̄	标量	
+    clip_pg_rho_threshold	算策略梯度优势时 ρ 的另一个上界 ρ̄_pg	标量
+    lamda	TD 误差往回传的衰减系数（和 λ-回报里的 λ 同角色）	标量
+
+    1. rhos [T, B] —— 上一讲的主角：每个 (t, b) 一个“折扣率”。来源是 get_logprob_and_rhos 算出的 clipped_rhos（进函数前已经被砍到 ≤1）。注意函数 docstring 写的是 log_rhos——那是从 trfl 库抄来的过时注释，这份实现实际接收的是已 exp、已截断的 ρ，别被 docstring 骗了。
+
+    2. discounts [T, B] —— 来自 ~is_final（第 3 步讲过：~ 必须配 dtype=np.bool）。本项目的取值只有 0/1：局内不打折、局边界一刀切断。
+
+    3. rewards [T, B] —— 本路奖励（第 2 步：winloss 真实输赢 / Levenshtein / Hamming），在 sum_vtrace_loss 里已切 [:-1] 对齐到“转移”。
+
+    4. values [T, B] —— 传进来的是 baselines[:-1]：价值头对本路状态的估计 V(s_t)。不含最后一步（最后一步另有用途，见下）。
+
+    5. bootstrap_value [B] —— baselines[-1]：窗口末端状态的估价。没有时间维，只有 batch 维——它是链条尽头的“一个点”，负责把“窗口外的未来值多少”折算进来。这是五个张量里唯一形状不同的。
+
+    6/7. 两个 clip 阈值（标量） —— trfl 原版里 ρ̄（管价值目标的收敛方向）和 ρ̄_pg（管策略梯度的方差）是两个独立的旋钮，IMPALA 论文里可以取不同值。但在本项目里都是空转：ρ 在上游已经被砍到 ≤1，函数内部第 213/216/270 行的 clamp(max=1) 对已经 ≤1 的数再砍一次，什么也不做。读代码时知道“这两个旋钮在这里没被使用”即可，学理论时再去 IMPALA 论文看它们的区别。
+
+    8. lamda = 0.8 —— 单步 TD 误差 δ_t 往回传播时每步乘的衰减（γλc），和 λ-回报里那个 λ 是同一个思想：越远的影响越小。
+
+    对齐图（五者怎么站位）
     """
 
     if clip_rho_threshold is not None:
@@ -212,6 +237,7 @@ def vtrace_from_importance_weights(
         clip_pg_rho_threshold = torch.tensor(clip_pg_rho_threshold, dtype=torch.float32, device=values.device)
 
     # Make sure tensor ranks are consistent.
+    # 限制新旧策略比率阈值的范围
     if clip_rho_threshold is not None:
         clipped_rhos = torch.clamp(rhos, max=clip_rho_threshold)
     else:
@@ -222,11 +248,16 @@ def vtrace_from_importance_weights(
     values_t_plus_1 = torch.cat(
         [values[1:], bootstrap_value.unsqueeze(0)], axis=0)
 
+    # rewards + discounts * values_t_plus_1 - values：这个应该是得到的优势，小于0表示新的动作策略不如旧策略，大于0表示新的动作策略优于新策略
+    # clipped_rhos 是 新旧策略的比率，乘上 ρ 打折扣（旧经验该信几折）。δ 是一步的意外
+    # 只看一步的 δ 太短视——价值网络初期不准，单步 TD 误差噪声大。所以 V-trace 要把未来所有步的意外也卷进来，拼成 vs。这就是 vs 和 td_lambda_loss 里 λ-回报的共同思想：多步信息比单步稳
     deltas = clipped_rhos * (rewards + discounts * values_t_plus_1 - values)
+    # torch.flip 这个操作是将序列倒序
     flip_discounts = torch.flip(discounts, dims=[0])
     flip_cs = torch.flip(cs, dims=[0])
     flip_deltas = torch.flip(deltas, dims=[0])
 
+    # 将三个序对应位置拼接起来
     sequences = [item for item in zip(flip_discounts, flip_cs, flip_deltas)]
 
     del flip_discounts, flip_cs, flip_deltas, deltas, values_t_plus_1, cs
@@ -236,7 +267,9 @@ def vtrace_from_importance_weights(
     # of the given trajectory.
     def scanfunc(acc, sequence_item):
         discount_t, c_t, delta_t = sequence_item
-        return delta_t + lamda * discount_t * c_t * acc
+        # return delta_t + lamda * discount_t * c_t * acc
+        # └δ┘    └λ┘   └γ┘      └c┘ └上一轮的累积┘
+        return delta_t + lamda * discount_t * c_t * acc # 这行在把“未来的意外”打折搬到今天
 
     initial_values = torch.zeros_like(bootstrap_value, device=bootstrap_value.device)
 
@@ -257,6 +290,9 @@ def vtrace_from_importance_weights(
 
         return torch.cat(res)
 
+    # 从末端往回滚”的循环本身（倒序、累积器、翻回来）就是 scan 框架在干的事——上一问讲过机制。语义上，展开后长这样：
+    # vs偏移_0 = δ_0 + (λγc)δ_1 + (λγc)²δ_2 + (λγc)³δ_3 + ...
+    # 每个未来时刻的“意外”对今天的影响力按距离指数衰减
     vs_minus_v_xs = scan(foo=scanfunc, x=sequences, initial_value=initial_values)
     del scanfunc, sequences, initial_values
 
@@ -264,6 +300,8 @@ def vtrace_from_importance_weights(
     vs_minus_v_xs = torch.flip(vs_minus_v_xs, dims=[0])
 
     # Add V(x_s) to get v_s.
+    # 这行是 V-trace 的最后一道拼装。一句话结论：scan 滚出来的只是“修正量”（偏移），这行把每步的价值头估计 V(s_t) 加回去，凑成完整的 vs——代码自己的注释就写着 "Add V(x_s) to get v_s"。
+    # 具体看md
     vs = torch.add(vs_minus_v_xs, values)
 
     # Advantage for policy gradient.
@@ -274,11 +312,22 @@ def vtrace_from_importance_weights(
     else:
         clipped_pg_rhos = rhos
 
+    # 这里的优势是已经累计了轨迹优势的对比
+    '''
+    括号里的部分：r_t + γ·vs_{t+1} − V(s_t) —— 眼熟吗？就是 TD 误差。但注意中段用的是 vs_{t+1}（上一讲讲的多步修匀价值），不是单步 V(s′)。翻译成人话：
+
+    “走完这一步，实际拿到的（即时奖励 + 修正后的未来估计），比我走之前预估的好多少？”
+
+    结果 > 0：这一步比预期好 → 下游策略梯度会抬高 π(a_t)，鼓励以后多走这种棋；
+    结果 < 0：这一步比预期差 → 压低 π(a_t)。
+    '''
     pg_advantages = (clipped_pg_rhos * (rewards + discounts * vs_t_plus_1 - values))
 
     del clipped_pg_rhos, rewards, discounts, vs_t_plus_1, values, vs_minus_v_xs, bootstrap_value
 
     # Make sure no gradients backpropagated through the returned values.
+    # 切断梯度，两个返回值只当常数用
+    # vs 和 pg_advantages 里都含有 values（价值头的输出，带梯度）。如果不断开，下游 (−log π) × 优势 的总损失会把梯度一路漏进价值头——价值头会学会往对自己有利的方向篡改 V，让“优势”变小，从而白捡低 loss。这就是第 3 步讲过的“自己追自己尾巴”的变体，必须断。
     return VTraceReturns(vs=vs.detach(), pg_advantages=pg_advantages.detach())
 
 
@@ -537,6 +586,7 @@ def log_prob(logits, actions, mask_used, max_selected, show=False, outlier_remov
     del logits, actions, entity_mask
 
     if selected_mask is not None:
+        # 展平掩码
         selected_mask = selected_mask.view(-1, selected_mask.shape[-1])
 
         selected_mask_index = torch.sum(selected_mask.float(), dim=-1)
